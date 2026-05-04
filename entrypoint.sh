@@ -6,6 +6,16 @@ set -euo pipefail
 
 # ---- rclone config from env (R2 + Dropbox) ----
 mkdir -p /root/.config/rclone
+# Decode the Dropbox token from base64 (bypasses env-var character mangling
+# we observed when passing the raw JSON blob through RunPod's env).
+if [ -n "${DROPBOX_TOKEN_B64:-}" ]; then
+  DROPBOX_TOKEN_JSON=$(printf '%s' "$DROPBOX_TOKEN_B64" | base64 -d)
+else
+  # Back-compat: accept the raw JSON if someone sets it that way.
+  DROPBOX_TOKEN_JSON="${RCLONE_DROPBOX_TOKEN:-}"
+fi
+echo "[entrypoint] dropbox token len: ${#DROPBOX_TOKEN_JSON} starts: ${DROPBOX_TOKEN_JSON:0:1}"
+
 cat > /root/.config/rclone/rclone.conf <<EOF
 [r2]
 type = s3
@@ -17,7 +27,7 @@ acl = private
 
 [dropbox]
 type = dropbox
-token = ${RCLONE_DROPBOX_TOKEN}
+token = ${DROPBOX_TOKEN_JSON}
 EOF
 chmod 600 /root/.config/rclone/rclone.conf
 
