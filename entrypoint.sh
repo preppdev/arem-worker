@@ -39,7 +39,7 @@ fetch() {
   echo "[entrypoint] downloading $r2_path → $local_path"
   rclone copyto "$r2_path" "$local_path" --progress=false
 }
-fetch "r2:arem-training-data/checkpoints/stage1_jxl_v1/best_lpips.pth" \
+fetch "r2:arem-training-data/checkpoints/stage1_jxl_full_v1/best_lpips.pth" \
       "/workspace/checkpoints/stage1_jxl_v1_best_lpips.pth"
 fetch "r2:arem-training-data/checkpoints/interior_full_v1/latest.pth" \
       "/workspace/checkpoints/interior_full_v1_latest.pth"
