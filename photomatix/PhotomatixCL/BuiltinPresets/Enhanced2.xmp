@@ -1,0 +1,20 @@
+<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+<rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+
+<rdf:Description rdf:about=''
+xmlns:pmtm='http://www.hdrsoft.com/photomatix_settings01'>
+<pmtm:Version>5.0</pmtm:Version>
+<pmtm:Method>Contrast Optimizer</pmtm:Method>
+<pmtm:Strength>50.0</pmtm:Strength>
+<pmtm:ToneCompression>-4.0</pmtm:ToneCompression>
+<pmtm:LightingEffect>50.0</pmtm:LightingEffect>
+<pmtm:WhiteClip>5.974</pmtm:WhiteClip>
+<pmtm:BlackClip>0.000</pmtm:BlackClip>
+<pmtm:Midtone>-5.0</pmtm:Midtone>
+<pmtm:ColorTemperature>0.0</pmtm:ColorTemperature>
+<pmtm:Saturation>0.0</pmtm:Saturation>
+<pmtm:IsPano360>No </pmtm:IsPano360>
+</rdf:Description>
+
+</rdf:RDF>
+</x:xmpmeta>

@@ -1,0 +1,18 @@
+<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+<rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+
+<rdf:Description rdf:about=''
+xmlns:pmtm='http://www.hdrsoft.com/tone_mapping_settings'>
+<pmtm:Version>4.2</pmtm:Version>
+<pmtm:Method>Tone Compressor</pmtm:Method>
+<pmtm:Brightness>-2.0</pmtm:Brightness>
+<pmtm:Compression>4.0</pmtm:Compression>
+<pmtm:Contrast>3.0</pmtm:Contrast>
+<pmtm:WhiteClip>5.000000</pmtm:WhiteClip>
+<pmtm:BlackClip>3.000000</pmtm:BlackClip>
+<pmtm:ColorTemperature>0.0</pmtm:ColorTemperature>
+<pmtm:Saturation>-10.0</pmtm:Saturation>
+</rdf:Description>
+
+</rdf:RDF>
+</x:xmpmeta>

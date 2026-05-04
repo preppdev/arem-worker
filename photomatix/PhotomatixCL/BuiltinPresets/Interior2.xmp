@@ -1,0 +1,18 @@
+<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+<rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+
+<rdf:Description rdf:about=''
+xmlns:pmtm='http://www.hdrsoft.com/photomatix_settings01'>
+<pmtm:Version>5.1</pmtm:Version>
+<pmtm:Method>Fusion/Interior</pmtm:Method>
+<pmtm:DepthHighlights>0.0</pmtm:DepthHighlights>
+<pmtm:Highlights>-10.0</pmtm:Highlights>
+<pmtm:Shadows>5.0</pmtm:Shadows>
+<pmtm:Brightness>4.0</pmtm:Brightness>
+<pmtm:LocalContrast>2.0</pmtm:LocalContrast>
+<pmtm:Saturation>1.0</pmtm:Saturation>
+<pmtm:IsPano360>No </pmtm:IsPano360>
+</rdf:Description>
+
+</rdf:RDF>
+</x:xmpmeta>

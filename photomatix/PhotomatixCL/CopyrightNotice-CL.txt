@@ -1,0 +1,100 @@
+PhotomatixCL is Copyright (c) 2003-2019 HDRsoft
+
+PhotomatixCL uses the following libraries:
+
+- Little cms, Copyright 1998-2006 Marti Maria
+
+- The Independent JPEG Group's JPEG Library
+
+- The TIFF Library (see coyright below)
+
+- The OpenEXR Library (see copyright below)
+
+- The Lensfun library and lens database (see license information below)
+
+- The LibRaw Library (see license information below)
+
+and the Exiftool executable Phil Harvey (see license information below)
+
+PhotomatixCL also uses part of Dave Coffin's raw photo decoder, Copyright 1997-2016 by Dave Coffin.
+
+
+===================================================================
+Copyright TIFF Library
+===================================================================
+Copyright (c) 1988-1996 Sam Leffler
+Copyright (c) 1991-1996 Silicon Graphics, Inc.
+
+Permission to use, copy, modify, distribute, and sell this software and 
+its documentation for any purpose is hereby granted without fee, provided
+that (i) the above copyright notices and this permission notice appear in
+all copies of the software and related documentation, and (ii) the names of
+Sam Leffler and Silicon Graphics may not be used in any advertising or
+publicity relating to the software without the specific, prior written
+permission of Sam Leffler and Silicon Graphics.
+
+THE SOFTWARE IS PROVIDED "AS-IS" AND WITHOUT WARRANTY OF ANY KIND, 
+EXPRESS, IMPLIED OR OTHERWISE, INCLUDING WITHOUT LIMITATION, ANY 
+WARRANTY OF MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.  
+
+IN NO EVENT SHALL SAM LEFFLER OR SILICON GRAPHICS BE LIABLE FOR
+ANY SPECIAL, INCIDENTAL, INDIRECT OR CONSEQUENTIAL DAMAGES OF ANY KIND,
+OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+WHETHER OR NOT ADVISED OF THE POSSIBILITY OF DAMAGE, AND ON ANY THEORY OF 
+LIABILITY, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE 
+OF THIS SOFTWARE.
+
+
+===================================================================
+Copyright OpenEXR Library
+===================================================================
+Copyright (c) 2002, Industrial Light & Magic, a division of Lucas Digital Ltd. LLC
+All rights reserved.
+ 
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+===================================================================
+License Lensfun Lens Database
+===================================================================
+The lens database included in the share\lensfun folder is based on the
+one maintained by the Lensfun project, and licensed under the Creative
+Commons Attribution-Share Alike 3.0 license which can be found here:
+https://creativecommons.org/licenses/by-sa/3.0/
+
+
+===================================================================
+License Lensfun Library
+===================================================================
+The libraries which are part of this package are licensed under the terms
+of the GNU Lesser General Public License, version 3. The library is
+included as liblensfun.dll. A copy of the license is available in
+the file lensfun-lgpl-3.txt.  You can read it here:
+http://www.gnu.org/licenses/lgpl-3.0.txt.
+The GPL it refers is in the file lensfun-gpl-3.txt.
+
+
+===================================================================
+License Exiftool Executable
+===================================================================
+Exiftool is licensed under the Artistic License.  The executable is
+available at http://www.sno.phy.queensu.ca/~phil/exiftool/
+
+===================================================================
+License LibRaw Library
+===================================================================
+The LibRaw library which is part of this package is licensed under the terms
+of the Common Development and Distribution License, Version 1.0.
+The source code for this library is slightly modified from the original
+LibRaw source, and is available on request.  Please email
+ support@hdrsoft.com if you wish to request a copy.
