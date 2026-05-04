@@ -219,7 +219,26 @@ def run_upright(pred_dir: Path, upright_root: Path, raw_dir: Path) -> Path:
         shutil.copy2(j, target)
         n_in += 1
     if n_in == 0:
-        raise RuntimeError(f"no predicted JPGs to upright in {pred_dir}")
+        # Surface why the pipeline produced no output. run_pipeline.py
+        # writes _meta.json with skip reasons (e.g. lens_excluded for
+        # FE 12-24mm GM — no lensfun profile available).
+        import json as _json
+        meta_path = pred_dir.parent / "_meta.json"
+        skip_summary = ""
+        if meta_path.is_file():
+            try:
+                meta = _json.loads(meta_path.read_text())
+                skips = [t.get("skip", "") for t in meta.get("triplets", []) if t.get("skip")]
+                if skips:
+                    from collections import Counter
+                    counts = Counter(skips)
+                    skip_summary = "; ".join(f"{c}× {r}" for r, c in counts.most_common())
+            except Exception:
+                pass
+        msg = f"no predicted JPGs — every triplet was skipped/failed."
+        if skip_summary:
+            msg += f" Reasons: {skip_summary}"
+        raise RuntimeError(msg)
 
     cmd = [PYTHON_BIN, str(UPRIGHT_REPO / "auto_upright.py"),
            "--in-dir", str(in_dir),
