@@ -18,8 +18,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.11 python3.11-dev python3-pip python3.11-venv \
         rclone curl ca-certificates \
-        libraw-dev liblensfun-bin liblensfun-dev lensfun-tools \
+        libraw-dev liblensfun1 liblensfun-bin liblensfun-dev \
         libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 \
+    && lensfun-update-data || true \
     && ln -sf /usr/bin/python3.11 /usr/local/bin/python \
     && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
     && rm -rf /var/lib/apt/lists/*
