@@ -162,32 +162,28 @@ def download_raws(dropbox_remote_path: str, local_raw_dir: Path) -> tuple[int, i
 
 
 def run_inference(local_raw_dir: Path, pred_root: Path) -> Path:
-    """Run the Stage 2 routed inference pipeline.
+    """Run the canonical Stage 1 (NAFNet) + Stage 2 (Restormer routed) pipeline.
 
-    Calls infer_shoot_routed.py via subprocess to keep deps isolated.
-    Returns the directory containing the predicted JPGs.
+    Calls pipeline/run_pipeline.py via subprocess to keep deps isolated.
+    Returns the directory containing the Stage 2 JPGs (named
+    <stem>_stage2-{int|ext}.jpg).
     """
     pred_root.mkdir(parents=True, exist_ok=True)
     cmd = [
-        PYTHON_BIN, str(AREM_REPO / "infer_shoot_routed.py"),
+        PYTHON_BIN, str(AREM_REPO / "run_pipeline.py"),
         "--raw-dir", str(local_raw_dir),
-        "--interior-checkpoint", str(CHECKPOINT_INTERIOR),
-        "--exterior-checkpoint", str(CHECKPOINT_EXTERIOR),
-        "--classifier", str(CLASSIFIER_PATH),
         "--output-dir", str(pred_root),
-        "--preset", "Interior2",
     ]
-    env = os.environ.copy()
-    env["PMTX_STATIC"] = PMTX_STATIC
+    # CHECKPOINT_STAGE1 / CHECKPOINT_INTERIOR / CHECKPOINT_EXTERIOR /
+    # CLASSIFIER_PATH come from the environment (Dockerfile defaults).
     log(f"  inference: {' '.join(cmd)}")
-    r = subprocess.run(cmd, env=env, capture_output=True, text=True,
-                       timeout=4 * 3600)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=4 * 3600)
     log(r.stdout[-2000:] if r.stdout else "")
     if r.returncode != 0:
         raise RuntimeError(f"inference failed rc={r.returncode}: {r.stderr[-500:]}")
-    pred_dir = pred_root / "predictions"
+    pred_dir = pred_root / "stage2"
     if not pred_dir.exists():
-        raise RuntimeError(f"no predictions/ dir under {pred_root}")
+        raise RuntimeError(f"no stage2/ dir under {pred_root}")
     return pred_dir
 
 
@@ -216,13 +212,10 @@ def run_upright(pred_dir: Path, upright_root: Path, raw_dir: Path) -> Path:
     shoot_in.mkdir(parents=True)
     n_in = 0
     for j in pred_dir.glob("*.jpg"):
-        # Routed pipeline emits '<stem>_pred-int.jpg' / '<stem>_pred-ext.jpg'.
-        # The upright module strips '_stage2-int'/'_stage2-ext' but not the
-        # '_pred-int'/'_pred-ext' form, so clean here before passing in.
-        clean = j.name
-        for suf in ("_pred-int", "_pred-ext", "_pred"):
-            clean = clean.replace(suf, "")
-        target = shoot_in / clean
+        # run_pipeline.py emits '<stem>_stage2-{int|ext}.jpg'. auto_upright
+        # already strips '_stage2-int'/'_stage2-ext' (see _mid_stem_from_input),
+        # so we copy as-is and let it produce clean output names.
+        target = shoot_in / j.name
         shutil.copy2(j, target)
         n_in += 1
     if n_in == 0:
