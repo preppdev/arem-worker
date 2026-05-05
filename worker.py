@@ -133,31 +133,47 @@ def rclone(args: list[str], timeout: int = 1800) -> subprocess.CompletedProcess:
 
 # ---- pipeline steps ----
 RAW_SUBFOLDER_CANDIDATES = ["01-RAW-Photos", "01-RAW-Files"]
+# Image formats we accept as bracket inputs. Raw formats hit rawpy + lensfun;
+# everything else gets decoded directly via PIL (lens correction skipped).
+ACCEPTED_EXTS = ["ARW", "arw", "JPG", "jpg", "JPEG", "jpeg",
+                 "TIF", "tif", "TIFF", "tiff", "PNG", "png",
+                 "JXL", "jxl", "WEBP", "webp"]
+
+
+def _include_flags(exts: list[str]) -> list[str]:
+    out = []
+    for e in exts:
+        out += ["--include", f"*.{e}"]
+    return out
 
 
 def download_raws(dropbox_remote_path: str, local_raw_dir: Path) -> tuple[int, int, str]:
     """Pull the RAW folder contents to local. Returns (file_count, bytes, used_subfolder).
 
+    Accepts any standard image format (ARW + JPG + TIFF + PNG + JXL + WEBP).
     Tries known RAW subfolder names in order; uses whichever exists.
     """
     local_raw_dir.mkdir(parents=True, exist_ok=True)
+    include_flags = _include_flags(ACCEPTED_EXTS)
     last_err = ""
     for candidate in RAW_SUBFOLDER_CANDIDATES:
         src = f"{dropbox_remote_path}/{candidate}"
-        ls = rclone(["lsf", src, "--include", "*.ARW", "--include", "*.arw"], timeout=60)
+        ls = rclone(["lsf", src, *include_flags], timeout=60)
         if ls.returncode != 0 or not ls.stdout.strip():
             last_err = f"{candidate}: rc={ls.returncode} {ls.stderr[-200:]}"
             continue
         r = rclone(["copy", src, str(local_raw_dir),
-                    "--include", "*.ARW", "--include", "*.arw",
+                    *include_flags,
                     "--transfers", "8", "--checkers", "16",
                     "--progress=false"])
         if r.returncode != 0:
             raise RuntimeError(f"rclone copy failed rc={r.returncode}: {r.stderr[-300:]}")
-        arws = list(local_raw_dir.glob("*.ARW")) + list(local_raw_dir.glob("*.arw"))
-        total = sum(p.stat().st_size for p in arws)
-        return len(arws), total, candidate
-    raise RuntimeError(f"no RAW subfolder found under {dropbox_remote_path} "
+        files = []
+        for ext in ACCEPTED_EXTS:
+            files += list(local_raw_dir.glob(f"*.{ext}"))
+        total = sum(p.stat().st_size for p in files)
+        return len(files), total, candidate
+    raise RuntimeError(f"no input images found under {dropbox_remote_path} "
                        f"(tried {RAW_SUBFOLDER_CANDIDATES}); last error: {last_err}")
 
 
@@ -201,11 +217,16 @@ def run_upright(pred_dir: Path, upright_root: Path, raw_dir: Path) -> Path:
     if arw_layout.exists():
         shutil.rmtree(arw_layout, ignore_errors=True)
     arw_layout.mkdir(parents=True, exist_ok=True)
-    for arw in list(raw_dir.glob("*.ARW")) + list(raw_dir.glob("*.arw")):
-        try:
-            (arw_layout / arw.name).symlink_to(arw)
-        except FileExistsError:
-            pass
+    # Symlink every input image (ARW or standard format) so auto_upright
+    # can find the source for EXIF-passthrough. exifread reads EXIF from
+    # ARW + JPG + TIFF identically.
+    for ext in ("ARW", "arw", "JPG", "jpg", "JPEG", "jpeg",
+                "TIF", "tif", "TIFF", "tiff", "JXL", "jxl"):
+        for src in raw_dir.glob(f"*.{ext}"):
+            try:
+                (arw_layout / src.name).symlink_to(src)
+            except FileExistsError:
+                pass
     shoot_in = in_dir / "shoot"
     if shoot_in.exists():
         shutil.rmtree(shoot_in)

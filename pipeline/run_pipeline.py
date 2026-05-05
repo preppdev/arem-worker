@@ -44,7 +44,7 @@ _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 from models.nafnet import NAFNet
 from models.restormer import Restormer
-from lens_correct import lens_correct_bracket, LensExcluded
+from lens_correct import lens_correct_bracket, LensExcluded, load_bracket_frame, RAW_EXTENSIONS
 
 import exifread
 
@@ -66,17 +66,41 @@ def parse_ev(s):
     except ValueError: return None
 
 
-ARW_RE = re.compile(r"^DSC(\d{4,5})\.ARW$", re.IGNORECASE)
+# Accept Sony ARW + standard image formats (JPG/JPEG/TIFF/PNG/JXL/WEBP).
+# All bracket frames within a single shoot must be the same format —
+# we don't fuse e.g. one ARW with two JPGs. Format is inferred from the
+# extension of the first matching file.
+ARW_RE = re.compile(r"^DSC(\d{4,5})\.(ARW|JPG|JPEG|TIF|TIFF|PNG|JXL|WEBP)$",
+                    re.IGNORECASE)
 MAX_MP = 12.0
 
 
-# -------- bracket grouping (canonical, ARW-only) --------
+# -------- bracket grouping --------
 
 def list_arws(shoot_raw_dir: Path) -> list[Path]:
-    return sorted(
-        [p for p in shoot_raw_dir.iterdir() if ARW_RE.match(p.name)],
-        key=lambda p: int(ARW_RE.match(p.name).group(1)),
-    )
+    """Return image files in DSC# order. Accepts ARW + standard formats.
+
+    If both raw and standard files exist with the same DSC#, prefer the
+    raw (rawpy + lensfun gives better quality). If only standard files
+    exist, use those.
+    """
+    by_dsc: dict[int, Path] = {}
+    for p in shoot_raw_dir.iterdir():
+        m = ARW_RE.match(p.name)
+        if not m:
+            continue
+        dsc = int(m.group(1))
+        ext = p.suffix.lower()
+        existing = by_dsc.get(dsc)
+        if existing is None:
+            by_dsc[dsc] = p
+        else:
+            # Prefer raw over standard for same DSC#.
+            existing_is_raw = existing.suffix.lower() in RAW_EXTENSIONS
+            new_is_raw = ext in RAW_EXTENSIONS
+            if new_is_raw and not existing_is_raw:
+                by_dsc[dsc] = p
+    return [by_dsc[k] for k in sorted(by_dsc)]
 
 
 def read_ev_and_time(arw: Path):
@@ -221,7 +245,13 @@ def load_stage1(ckpt: Path, device):
 
 
 def lens_correct_16(arw: Path, db) -> tuple[np.ndarray, dict]:
-    rgb, info = lens_correct_bracket(arw, out_bps=16, db=db)
+    """Decode + (if raw) lens-correct, returning uint16 RGB.
+
+    Routes through load_bracket_frame() which handles both raw paths
+    (rawpy + lensfun) and standard image paths (PIL decode + 8→16 bit
+    promotion).
+    """
+    rgb, info = load_bracket_frame(arw, out_bps=16, db=db)
     if rgb.dtype != np.uint16:
         rgb = rgb.astype(np.uint16) << 8 if rgb.dtype == np.uint8 else rgb.astype(np.uint16)
     return rgb, info

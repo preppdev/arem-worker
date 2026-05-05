@@ -306,16 +306,22 @@ def upright_one(img_path: Path, out_path: Path,
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_rgb = cv2.cvtColor(out_img, cv2.COLOR_BGR2RGB)
 
-    # Look up source ARW. With the flat layout used by the production worker,
-    # ARWs are at arw_root/<stem>.ARW. Default convention is the per-shoot
-    # nesting under 01-RAW-Photos.
+    # Look up source file for EXIF passthrough. ARW preferred, but accept
+    # JPG/TIFF/JXL too — exifread reads EXIF identically across formats
+    # and shoots may come in as standard images now.
     mid_stem = out_path.stem
     shoot = out_path.parent.name
-    if ARW_FLAT:
-        arw_path = arw_root / f"{mid_stem}.ARW"
-    else:
-        arw_path = arw_root / shoot / "01-RAW-Photos" / f"{mid_stem}.ARW"
-    arw_meta = read_arw_exif(arw_path)
+    arw_path = None
+    for ext in ("ARW", "arw", "JPG", "jpg", "JPEG", "jpeg",
+                "TIF", "tif", "TIFF", "tiff", "JXL", "jxl"):
+        if ARW_FLAT:
+            cand = arw_root / f"{mid_stem}.{ext}"
+        else:
+            cand = arw_root / shoot / "01-RAW-Photos" / f"{mid_stem}.{ext}"
+        if cand.is_file():
+            arw_path = cand
+            break
+    arw_meta = read_arw_exif(arw_path) if arw_path is not None else {}
 
     # Year for copyright: from DateTimeOriginal, fallback to current.
     year = datetime.now().year

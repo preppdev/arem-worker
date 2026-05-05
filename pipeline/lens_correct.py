@@ -32,6 +32,13 @@ import rawpy
 
 logger = logging.getLogger(__name__)
 
+# File extensions that go through the rawpy + lensfun path. Anything else
+# (JPG/JPEG/TIFF/PNG/JXL/WEBP) goes through decode_standard_image() — no
+# demosaic, no lens correction, just decode + upscale to 16-bit so the
+# rest of the pipeline (NAFNet 9-ch input, Restormer Stage 2) can treat
+# it identically.
+RAW_EXTENSIONS = {".arw", ".cr2", ".cr3", ".nef", ".dng", ".raf", ".rw2"}
+
 # Lenses we explicitly exclude from the Stage 1 POC because they have no
 # usable upstream lensfun profile. Match by the LensModel substring.
 EXCLUDED_LENS_SUBSTRINGS = (
@@ -150,11 +157,15 @@ def lens_correct_bracket(
 
     exif = _read_lens_exif(arw_path)
     lens_model_exif = exif.get("model", "")
-    if any(s.upper() in lens_model_exif.upper() for s in EXCLUDED_LENS_SUBSTRINGS):
-        raise LensExcluded(
-            f"{arw_path.name}: LensModel {lens_model_exif!r} is on POC "
-            f"exclusion list (no usable lensfun profile)"
-        )
+    # Lenses on the exclusion list have no upstream lensfun profile — we
+    # used to raise LensExcluded and skip the whole bracket. As of
+    # 2026-05-04, instead bypass lens correction and continue: rawpy
+    # demosaic still produces a usable image, just without distortion /
+    # vignetting / TCA correction. Mark this in info["skip_reason"] so
+    # the caller knows correction was bypassed.
+    excluded_lens = any(
+        s.upper() in lens_model_exif.upper() for s in EXCLUDED_LENS_SUBSTRINGS
+    )
 
     with rawpy.imread(str(arw_path)) as raw:
         rgb = raw.postprocess(
@@ -175,6 +186,14 @@ def lens_correct_bracket(
         "applied": False,
         "skip_reason": None,
     }
+
+    # Excluded lens — bypass lensfun lookup entirely.
+    if excluded_lens:
+        info["skip_reason"] = (
+            f"lens {lens_model_exif!r} on POC exclusion list — "
+            f"continuing without lens correction"
+        )
+        return rgb, info
 
     if db is None:
         import lensfunpy
@@ -225,6 +244,48 @@ def lens_correct_bracket(
         info["skip_reason"] = f"lensfun apply error: {type(e).__name__}: {e}"
         logger.warning("lens_correct: %s on %s", info["skip_reason"], arw_path.name)
         return rgb, info
+
+
+def decode_standard_image(path: Path, *, out_bps: int = 16) -> Tuple[np.ndarray, dict]:
+    """Decode a JPG/JPEG/TIFF/PNG/JXL/WEBP into a uint16 numpy array.
+
+    The pipeline expects 16-bit RGB after the demosaic step. For 8-bit
+    inputs we left-shift by 8 to map [0, 255] → [0, 65535] (i.e. ×257
+    via simple bit replication, equivalent to "pad zeros" in the
+    low-byte). This is the standard 8→16 bit promotion.
+    """
+    from PIL import Image
+
+    path = Path(path)
+    img = Image.open(path).convert("RGB")
+    arr = np.array(img)
+    if arr.dtype == np.uint8:
+        if out_bps == 16:
+            arr = (arr.astype(np.uint16) << 8) | arr.astype(np.uint16)
+    elif arr.dtype == np.uint16:
+        if out_bps == 8:
+            arr = (arr >> 8).astype(np.uint8)
+    info = {
+        "lens_model_exif": "",
+        "lensfun_maker": None,
+        "lensfun_model": None,
+        "applied": False,
+        "skip_reason": f"non-raw input ({path.suffix.lower()}); lens correction skipped",
+        "input_format": path.suffix.lower(),
+    }
+    return arr, info
+
+
+def load_bracket_frame(
+    path: Path, *, out_bps: int = 16, db=None,
+) -> Tuple[np.ndarray, dict]:
+    """Format-agnostic loader: route to lens_correct_bracket() for raw
+    files, decode_standard_image() for everything else.
+    """
+    path = Path(path)
+    if path.suffix.lower() in RAW_EXTENSIONS:
+        return lens_correct_bracket(path, out_bps=out_bps, db=db)
+    return decode_standard_image(path, out_bps=out_bps)
 
 
 if __name__ == "__main__":
