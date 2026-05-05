@@ -53,3 +53,66 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Update RunPod template to new SHA-tagged image
+        if: github.ref == 'refs/heads/main' && env.RUNPOD_API_KEY != ''
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          RUNPOD_TEMPLATE_ID: ${{ secrets.RUNPOD_TEMPLATE_ID }}
+          RUNPOD_REGISTRY_AUTH_ID: ${{ secrets.RUNPOD_REGISTRY_AUTH_ID }}
+        run: |
+          # Use the short-SHA tag so each release is uniquely addressable.
+          # When the template's imageName changes, RunPod will pull the new
+          # image on next worker spawn — eliminates stale-:latest workers.
+          SHORT_SHA=sha-$(echo "${{ github.sha }}" | cut -c1-7)
+          IMAGE="ghcr.io/${{ github.repository }}:${SHORT_SHA}"
+          echo "Updating RunPod template to: $IMAGE"
+          # Build the saveTemplate mutation. We have to send the full input
+          # (RunPod's API doesn't support PATCH-style partial updates).
+          # Env vars on the template are managed manually via the dashboard
+          # or a separate setup script — this step ONLY updates the image.
+          curl -s -X POST https://api.runpod.io/graphql \
+            -H "Authorization: Bearer $RUNPOD_API_KEY" \
+            -H "Content-Type: application/json" \
+            --data-binary @- <<EOF | tee /tmp/runpod_resp.json
+          {
+            "query": "query Q(\$id: String!) { myself { podTemplates { id name imageName containerDiskInGb volumeInGb volumeMountPath dockerArgs ports readme isServerless isPublic containerRegistryAuthId env { key value } } } }",
+            "variables": {"id": "$RUNPOD_TEMPLATE_ID"}
+          }
+          EOF
+          # Find our template by id, then re-save with new imageName.
+          python3 <<PY
+          import json, os, urllib.request
+          with open('/tmp/runpod_resp.json') as f: resp = json.load(f)
+          tpls = resp['data']['myself']['podTemplates']
+          target_id = "$RUNPOD_TEMPLATE_ID"
+          tpl = next((t for t in tpls if t['id'] == target_id), None)
+          if tpl is None:
+              print(f"ERROR: template id '{target_id}' not found")
+              raise SystemExit(1)
+          tpl['imageName'] = "$IMAGE"
+          tpl['containerRegistryAuthId'] = "$RUNPOD_REGISTRY_AUTH_ID"
+          mutation = """mutation S(\$input: SaveTemplateInput!) {
+            saveTemplate(input: \$input) { id imageName }
+          }"""
+          # SaveTemplate expects all required fields populated.
+          fields = ['id', 'name', 'imageName', 'containerDiskInGb', 'volumeInGb',
+                    'volumeMountPath', 'dockerArgs', 'ports', 'readme',
+                    'isServerless', 'isPublic', 'containerRegistryAuthId', 'env']
+          input_var = {k: tpl.get(k, '' if k in ('volumeMountPath','dockerArgs','ports','readme') else None) for k in fields}
+          # Coerce nones to safe defaults
+          for nullable in ('volumeMountPath','dockerArgs','ports','readme'):
+              if input_var[nullable] is None: input_var[nullable] = ''
+          if input_var.get('volumeInGb') is None: input_var['volumeInGb'] = 0
+          payload = json.dumps({"query": mutation, "variables": {"input": input_var}}).encode()
+          req = urllib.request.Request(
+              "https://api.runpod.io/graphql",
+              data=payload, method="POST",
+              headers={"Authorization": f"Bearer {os.environ['RUNPOD_API_KEY']}",
+                       "Content-Type": "application/json"})
+          with urllib.request.urlopen(req, timeout=30) as r:
+              out = json.load(r)
+          print(json.dumps(out, indent=2))
+          if 'errors' in out:
+              raise SystemExit(1)
+          PY
