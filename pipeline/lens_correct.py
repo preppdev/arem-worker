@@ -174,7 +174,11 @@ def lens_correct_bracket(
             no_auto_bright=no_auto_bright,
             output_bps=16 if out_bps == 16 else 8,
             output_color=rawpy.ColorSpace.sRGB,
-            user_flip=0,
+            # user_flip=-1: honor the camera's EXIF Orientation tag.
+            # Vertical-shot frames stay vertical; horizontal stay horizontal.
+            # Earlier user_flip=0 forced sensor-native landscape, which
+            # rotated portrait shoots 90° on output.
+            user_flip=-1,
         )
     if out_bps == 8 and rgb.dtype != np.uint8:
         rgb = (rgb >> 8).astype(np.uint8) if rgb.dtype == np.uint16 else rgb
