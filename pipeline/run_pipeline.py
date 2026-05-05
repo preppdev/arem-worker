@@ -375,9 +375,14 @@ def stage2_infer(model, jpg_path: Path, out_path: Path, device,
     if h16 * w16 <= 16 * 1024 * 1024:
         x = torch.from_numpy(img.astype(np.float32)).permute(2, 0, 1).unsqueeze(0) / 255.0
         x = x.to(device)
+        # Restormer in fp32 (no autocast). MDTA's channel-softmax saturates
+        # under fp16 autocast and produces a horizontal-stripe periodic
+        # texture (FFT-confirmed 2026-05-05: pure-horizontal peaks at 8/16/32 px,
+        # 80-170× background, on residual S2-S1). NAFNet Stage 1 has no
+        # softmax-attention so fp16 stays safe there. A6000 48 GB has the
+        # headroom for fp32 single-pass at 16 MP.
         with torch.no_grad():
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                y = model(x)
+            y = model(x)
         y = torch.clamp(y, 0, 1)
         out = (y.squeeze(0).float().cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
         Image.fromarray(out).save(out_path, quality=quality)
@@ -405,9 +410,9 @@ def stage2_infer(model, jpg_path: Path, out_path: Path, device,
             patch = img[y0:y0 + tile, x0:x0 + tile]
             xt = torch.from_numpy(patch.astype(np.float32)).permute(2, 0, 1).unsqueeze(0) / 255.0
             xt = xt.to(device)
+            # fp32 — see fp16 / MDTA-softmax note in single-pass branch above.
             with torch.no_grad():
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    yt = model(xt)
+                yt = model(xt)
             yt = torch.clamp(yt, 0, 1)
             pred = yt.squeeze(0).float().cpu().permute(1, 2, 0).numpy()
             out[y0:y0 + tile, x0:x0 + tile] += pred * win[:, :, None]
