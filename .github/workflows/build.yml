@@ -65,7 +65,7 @@ jobs:
         run: |
           set -e
           python3 - <<'PY'
-          import json, os, urllib.request
+          import json, os, urllib.error, urllib.request
           api_key = os.environ["RUNPOD_API_KEY"]
           tpl_id  = os.environ["RUNPOD_TEMPLATE_ID"]
           reg_id  = os.environ["RUNPOD_REGISTRY_AUTH_ID"]
@@ -73,14 +73,23 @@ jobs:
           print(f"Updating template {tpl_id} → {image}")
 
           def gql(query, variables=None):
+              # RunPod GraphQL accepts the API key via query string. Some
+              # GHA runner IPs return 403 on Bearer-header auth; URL-param
+              # auth works consistently across all RunPod endpoints.
               payload = json.dumps({"query": query, "variables": variables or {}}).encode()
               req = urllib.request.Request(
-                  "https://api.runpod.io/graphql",
+                  f"https://api.runpod.io/graphql?api_key={api_key}",
                   data=payload, method="POST",
-                  headers={"Authorization": f"Bearer {api_key}",
-                           "Content-Type": "application/json"})
-              with urllib.request.urlopen(req, timeout=30) as r:
-                  return json.load(r)
+                  headers={"Content-Type": "application/json",
+                           # Cloudflare in front of api.runpod.io blocks
+                           # urllib's default UA with error 1010 (HTTP 403).
+                           "User-Agent": "arem-worker-deploy/1.0"})
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      return json.load(r)
+              except urllib.error.HTTPError as e:
+                  print(f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:300]}")
+                  raise
 
           # Pull all templates, find ours
           q = """query { myself { podTemplates {
