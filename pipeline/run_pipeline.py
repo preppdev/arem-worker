@@ -269,7 +269,13 @@ def stage2_infer(model, jpg_path: Path, out_path: Path, device,
     w16 = (w // 16) * 16
     img = img[:h16, :w16]
 
-    if h16 * w16 <= 8 * 1024 * 1024:
+    # 16 MP single-pass: A6000 (48 GB) handles 12-16 MP comfortably with the
+    # _safe_depthwise_3x3 wrapper in models/restormer.py spatially chunking
+    # any depthwise tensor that would exceed PyTorch's int32 indexing limit.
+    # The old 8 MP threshold was for the 24 GB 3090; on serverless A6000 it
+    # was forcing every 12 MP shoot through tiling and producing seam-pattern
+    # artifacts that look like the "same tiling" Jordan saw.
+    if h16 * w16 <= 16 * 1024 * 1024:
         x = torch.from_numpy(img.astype(np.float32)).permute(2, 0, 1).unsqueeze(0) / 255.0
         x = x.to(device)
         with torch.no_grad():
