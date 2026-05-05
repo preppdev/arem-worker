@@ -299,8 +299,21 @@ def process_job(job: dict) -> dict:
     log(f"  [4/4] uploading to {DROPBOX_OUTPUT_FOLDER}")
     n_jpg = upload_outputs(upright_dir, dropbox_path)
 
+    # Read _meta.json from the inference step to surface grouping failures.
+    # Each anchor that couldn't be paired into a complete bracket is a
+    # data-hygiene issue the photographer / labeler should look at.
+    import json as _json
+    grouping_warnings: list[dict] = []
+    meta_path = pred_root / "_meta.json"
+    if meta_path.is_file():
+        try:
+            meta = _json.loads(meta_path.read_text())
+            grouping_warnings = meta.get("group_failures", []) or []
+        except Exception:
+            pass
+
     runtime_sec = round(time.time() - t0, 1)
-    log(f"  done. {n_jpg} JPGs in {runtime_sec}s")
+    log(f"  done. {n_jpg} JPGs in {runtime_sec}s; {len(grouping_warnings)} grouping warnings")
 
     # Cleanup local scratch — keep raws if it failed earlier (won't reach here)
     try:
@@ -315,6 +328,7 @@ def process_job(job: dict) -> dict:
         "runtimeSec": runtime_sec,
         "rawSubfolder": raw_subfolder,
         "outputFolder": f"{stored_path}/{DROPBOX_OUTPUT_FOLDER}",
+        "groupingWarnings": grouping_warnings,
     }
 
 

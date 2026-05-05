@@ -123,61 +123,79 @@ def read_ev(arw: Path):
     return read_ev_and_time(arw)[0]
 
 
-# Maximum allowed shutter-time gap between ARWs in the same bracket (seconds).
-# Real brackets shoot all 3 frames within ~1s. The 5s budget covers slow
-# bracketing modes while rejecting stray frames from earlier in the day
-# whose DSC# happens to sit adjacent in the directory listing.
-BRACKET_TIME_WINDOW_S = 5.0
+# Mid-frame anchor: an ARW whose EV bias is within ±1.0 stops of zero is
+# treated as a candidate "mid" of a bracket. From there we check the
+# immediate DSC# neighbors (anchor-1, anchor+1) — those must classify as
+# under (negative EV) and over (positive EV) respectively for a valid
+# triplet. No warmup frames, no fuzzy windows. If the immediate-neighbor
+# rule doesn't hold, the anchor is flagged as a grouping failure for
+# human review, never silently re-paired.
+ANCHOR_EV_ABS_MAX = 1.0
 
 
-def find_triplets(arws: list[Path]) -> list[tuple[Path, Path, Path]]:
+def find_triplets(arws: list[Path]) -> tuple[list[tuple[Path, Path, Path]], list[dict]]:
+    """Return (triplets, failures).
+
+    triplets — list of (under, mid, over) tuples for valid brackets.
+    failures — list of {"anchor", "reason"} dicts for mid candidates
+                that couldn't be paired. Surfaced in _meta.json + the
+                job's errorMessage so humans can fix data hygiene.
+    """
+    triplets: list[tuple[Path, Path, Path]] = []
+    failures: list[dict] = []
     if not arws:
-        return []
-    # Read EV + shutter time once per ARW.
-    evs = []
-    for a in arws:
-        ev, t = read_ev_and_time(a)
-        evs.append((a, ev, classify_ev(ev), t))
+        return triplets, failures
 
-    triplets = []
-    used = set()
-    for i, (a, ev, role, t_anchor) in enumerate(evs):
-        if i in used or role is None:
+    # Index ARWs by DSC number; read EV once per ARW.
+    by_dsc: dict[int, tuple[Path, float | None]] = {}
+    for a in arws:
+        m = ARW_RE.match(a.name)
+        if not m:
             continue
-        # Anchor needs a usable shutter time for proximity gating; if missing,
-        # fall back to the old DSC#-only behavior for this anchor.
-        roles = {role: (i, a)}
-        j = i + 1
-        while j < len(evs) and j - i < 12 and len(roles) < 3:
-            if j in used:
-                j += 1; continue
-            r = evs[j][2]
-            t_cand = evs[j][3]
-            if t_anchor is not None and t_cand is not None:
-                if abs(t_cand - t_anchor) > BRACKET_TIME_WINDOW_S:
-                    j += 1; continue
-            if r and r not in roles:
-                roles[r] = (j, evs[j][0])
-            j += 1
-        if len(roles) < 3:
-            k = i - 1
-            while k >= 0 and i - k < 12 and len(roles) < 3:
-                if k in used:
-                    k -= 1; continue
-                r = evs[k][2]
-                t_cand = evs[k][3]
-                if t_anchor is not None and t_cand is not None:
-                    if abs(t_cand - t_anchor) > BRACKET_TIME_WINDOW_S:
-                        k -= 1; continue
-                if r and r not in roles:
-                    roles[r] = (k, evs[k][0])
-                k -= 1
-        if len(roles) == 3:
-            tup = (roles["under"][1], roles["mid"][1], roles["over"][1])
-            triplets.append(tup)
-            for idx, _ in roles.values():
-                used.add(idx)
-    return triplets
+        dsc = int(m.group(1))
+        ev, _ = read_ev_and_time(a)
+        by_dsc[dsc] = (a, ev)
+
+    for dsc in sorted(by_dsc):
+        path, ev = by_dsc[dsc]
+        # Anchor candidate: EV in [-ANCHOR_EV_ABS_MAX, +ANCHOR_EV_ABS_MAX]
+        if ev is None or abs(ev) > ANCHOR_EV_ABS_MAX:
+            continue
+
+        prev = by_dsc.get(dsc - 1)
+        nxt = by_dsc.get(dsc + 1)
+        if prev is None and nxt is None:
+            failures.append({"anchor": path.name, "ev": ev,
+                             "reason": "no immediate DSC# neighbors present"})
+            continue
+        if prev is None:
+            failures.append({"anchor": path.name, "ev": ev,
+                             "reason": f"missing DSC{dsc-1} (under candidate)"})
+            continue
+        if nxt is None:
+            failures.append({"anchor": path.name, "ev": ev,
+                             "reason": f"missing DSC{dsc+1} (over candidate)"})
+            continue
+
+        prev_path, prev_ev = prev
+        nxt_path, nxt_ev = nxt
+        if prev_ev is None or nxt_ev is None:
+            failures.append({"anchor": path.name, "ev": ev,
+                             "reason": f"neighbor EV unreadable "
+                                       f"(prev={prev_ev}, next={nxt_ev})"})
+            continue
+        if not (prev_ev < 0):
+            failures.append({"anchor": path.name, "ev": ev,
+                             "reason": f"DSC{dsc-1} not under (EV={prev_ev})"})
+            continue
+        if not (nxt_ev > 0):
+            failures.append({"anchor": path.name, "ev": ev,
+                             "reason": f"DSC{dsc+1} not over (EV={nxt_ev})"})
+            continue
+
+        triplets.append((prev_path, path, nxt_path))
+
+    return triplets, failures
 
 
 # -------- Stage 1 (NAFNet) --------
@@ -397,11 +415,18 @@ def process_shoot(raw_dir: Path, out_dir: Path,
     db = lensfunpy.Database()
 
     arws = list_arws(raw_dir)
-    triplets = find_triplets(arws)
+    triplets, group_failures = find_triplets(arws)
     print(f"\n{raw_dir}: {len(arws)} ARWs → {len(triplets)} triplets", flush=True)
+    if group_failures:
+        print(f"  ⚠ {len(group_failures)} grouping failures:", flush=True)
+        for f in group_failures[:10]:
+            print(f"    - {f['anchor']} (EV={f['ev']}): {f['reason']}", flush=True)
+        if len(group_failures) > 10:
+            print(f"    ... and {len(group_failures)-10} more", flush=True)
 
     meta = {"raw_dir": str(raw_dir), "n_arws": len(arws),
-            "n_triplets": len(triplets), "triplets": []}
+            "n_triplets": len(triplets), "triplets": [],
+            "group_failures": group_failures}
     n_int = n_ext = 0
     grand_t0 = time.time()
 
