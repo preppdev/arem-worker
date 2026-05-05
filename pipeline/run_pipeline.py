@@ -79,38 +79,83 @@ def list_arws(shoot_raw_dir: Path) -> list[Path]:
     )
 
 
-def read_ev(arw: Path):
+def read_ev_and_time(arw: Path):
+    """Returns (ev_float | None, shutter_time_seconds_float | None).
+
+    `shutter_time_seconds_float` is DateTimeOriginal converted to seconds since
+    epoch (using SubSecTimeOriginal for sub-second precision), used as the
+    bracket-grouping anchor — DSC# order is unreliable when the photographer
+    has stray frames from earlier in the day with lower numbers.
+    """
+    import datetime as _dt
     with arw.open("rb") as fh:
-        tags = exifread.process_file(fh, details=False, stop_tag="EXIF ExposureBiasValue")
+        tags = exifread.process_file(fh, details=False, stop_tag="EXIF SubSecTimeOriginal")
+    # EV
+    ev = None
     v = tags.get("EXIF ExposureBiasValue")
-    if v is None or not v.values:
-        return None
-    r = v.values[0]
-    try:
-        return r.num / r.den
-    except (ZeroDivisionError, AttributeError):
-        return parse_ev(str(v))
+    if v is not None and v.values:
+        r = v.values[0]
+        try:
+            ev = r.num / r.den
+        except (ZeroDivisionError, AttributeError):
+            ev = parse_ev(str(v))
+    # Shutter time
+    t_sec = None
+    dt_tag = tags.get("EXIF DateTimeOriginal")
+    if dt_tag is not None:
+        try:
+            base = _dt.datetime.strptime(str(dt_tag), "%Y:%m:%d %H:%M:%S")
+            sub = tags.get("EXIF SubSecTimeOriginal")
+            sub_ms = 0.0
+            if sub is not None:
+                try:
+                    sub_ms = float(f"0.{str(sub)}")
+                except ValueError:
+                    pass
+            t_sec = base.timestamp() + sub_ms
+        except (ValueError, TypeError):
+            pass
+    return ev, t_sec
+
+
+def read_ev(arw: Path):
+    """Back-compat shim — only used externally if anything else imports it."""
+    return read_ev_and_time(arw)[0]
+
+
+# Maximum allowed shutter-time gap between ARWs in the same bracket (seconds).
+# Real brackets shoot all 3 frames within ~1s. The 5s budget covers slow
+# bracketing modes while rejecting stray frames from earlier in the day
+# whose DSC# happens to sit adjacent in the directory listing.
+BRACKET_TIME_WINDOW_S = 5.0
 
 
 def find_triplets(arws: list[Path]) -> list[tuple[Path, Path, Path]]:
     if not arws:
         return []
+    # Read EV + shutter time once per ARW.
     evs = []
     for a in arws:
-        ev = read_ev(a)
-        evs.append((a, ev, classify_ev(ev)))
+        ev, t = read_ev_and_time(a)
+        evs.append((a, ev, classify_ev(ev), t))
 
     triplets = []
     used = set()
-    for i, (a, ev, role) in enumerate(evs):
+    for i, (a, ev, role, t_anchor) in enumerate(evs):
         if i in used or role is None:
             continue
+        # Anchor needs a usable shutter time for proximity gating; if missing,
+        # fall back to the old DSC#-only behavior for this anchor.
         roles = {role: (i, a)}
         j = i + 1
         while j < len(evs) and j - i < 12 and len(roles) < 3:
             if j in used:
                 j += 1; continue
             r = evs[j][2]
+            t_cand = evs[j][3]
+            if t_anchor is not None and t_cand is not None:
+                if abs(t_cand - t_anchor) > BRACKET_TIME_WINDOW_S:
+                    j += 1; continue
             if r and r not in roles:
                 roles[r] = (j, evs[j][0])
             j += 1
@@ -120,6 +165,10 @@ def find_triplets(arws: list[Path]) -> list[tuple[Path, Path, Path]]:
                 if k in used:
                     k -= 1; continue
                 r = evs[k][2]
+                t_cand = evs[k][3]
+                if t_anchor is not None and t_cand is not None:
+                    if abs(t_cand - t_anchor) > BRACKET_TIME_WINDOW_S:
+                        k -= 1; continue
                 if r and r not in roles:
                     roles[r] = (k, evs[k][0])
                 k -= 1
