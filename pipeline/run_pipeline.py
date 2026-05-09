@@ -318,8 +318,15 @@ def load_stage2(ckpt: Path, device):
     """Load a Stage 2 checkpoint. Dispatches by `arch` field:
        - "nafnet": new may26 NAFNet w32 — uses arch hyperparams from ckpt
        - "restormer" or missing: legacy Restormer dim=48 (default)
+
+    NAFNet weights are cast to bf16 in place — the activation memory at 12 MP
+    fp32 single-pass exceeds the 48 GB A40/A6000 budget once Stage 1, classifier,
+    and both Stage 2 models are resident. NAFNet has no MDTA softmax to break
+    under half precision, so bf16 weights + bf16 activations is safe.
     """
-    ck = torch.load(str(ckpt), map_location=device, weights_only=False)
+    # Load to CPU to avoid temporarily holding the full ckpt (model + EMA + extras)
+    # in GPU memory; only the picked state dict moves to GPU via load_state_dict.
+    ck = torch.load(str(ckpt), map_location="cpu", weights_only=False)
     arch = (ck.get("arch") or "restormer").lower()
 
     if arch == "nafnet":
@@ -333,13 +340,13 @@ def load_stage2(ckpt: Path, device):
             dec_blk_nums=ck.get("dec_blk_nums", [2, 2, 2, 2]),
             use_residual=ck.get("use_residual", True),
             residual_start=ck.get("residual_start", 0),
-        ).to(device)
+        )
     else:
         model = RestormerStage2(
             in_channels=3, out_channels=3,
             dim=48, num_blocks=[4, 6, 6, 8],
             num_refinement_blocks=4, use_residual=False,
-        ).to(device)
+        )
 
     # Prefer EMA weights if present
     if ck.get("ema_state_dict"):
@@ -352,8 +359,18 @@ def load_stage2(ckpt: Path, device):
     model.load_state_dict(sd, strict=False)
     model.eval()
     model._arch = arch
-    print(f"  loaded {ckpt.name} arch={arch} ({len(sd)} keys) ep={ck.get('epoch')} "
-          f"metrics={ck.get('metrics')}", flush=True)
+
+    # Free the on-CPU ckpt dict ASAP (incl. any optimizer state in legacy ckpts)
+    del ck, sd
+
+    if arch == "nafnet":
+        model = model.to(device).bfloat16()
+    else:
+        model = model.to(device)
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print(f"  loaded {ckpt.name} arch={arch} dtype={next(model.parameters()).dtype}", flush=True)
     return model
 
 
@@ -392,24 +409,22 @@ def stage2_infer(model, jpg_path: Path, out_path: Path, device,
     img = img[:h16, :w16]
 
     arch = getattr(model, "_arch", "restormer")
-    # Single-pass only (no tiling). NAFNet runs under bf16 autocast — no MDTA
-    # softmax to break, ~halves activation memory and avoids the OOM that
-    # killed prod jobs on 2026-05-09 (w32 fp32 single-pass at 12 MP needs ~40
-    # GB and collides with Stage 1 + classifier + both Stage 2 models resident).
-    # Restormer stays in fp32 to avoid the FFT-confirmed horizontal-stripe
-    # periodic texture from MDTA channel-softmax saturating under fp16.
+    # Single-pass only (no tiling). NAFNet weights + activations run in bf16
+    # (model already cast in load_stage2). Restormer stays fp32 — its MDTA
+    # channel-softmax saturates under half precision and produces an
+    # FFT-confirmed horizontal-stripe periodic texture.
     if h16 * w16 <= 16 * 1024 * 1024:
         x = torch.from_numpy(img.astype(np.float32)).permute(2, 0, 1).unsqueeze(0) / 255.0
-        x = x.to(device)
+        if arch == "nafnet":
+            x = x.to(device, dtype=torch.bfloat16)
+        else:
+            x = x.to(device)
         with torch.no_grad():
-            if arch == "nafnet":
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    y = model(x)
-            else:
-                y = model(x)
-        y = torch.clamp(y, 0, 1)
-        out = (y.squeeze(0).float().cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            y = model(x)
+        y = torch.clamp(y.float(), 0, 1)
+        out = (y.squeeze(0).cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
         Image.fromarray(out).save(out_path, quality=quality)
+        del x, y
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return h16, w16
