@@ -315,10 +315,33 @@ class RestormerStage2(Restormer):
 
 
 def load_stage2(ckpt: Path, device):
+    """Load a Stage 2 checkpoint. Dispatches by `arch` field:
+       - "nafnet": new may26 NAFNet w32 — uses arch hyperparams from ckpt
+       - "restormer" or missing: legacy Restormer dim=48 (default)
+    """
     ck = torch.load(str(ckpt), map_location=device, weights_only=False)
-    model = RestormerStage2(in_channels=3, out_channels=3,
-                             dim=48, num_blocks=[4, 6, 6, 8],
-                             num_refinement_blocks=4, use_residual=False).to(device)
+    arch = (ck.get("arch") or "restormer").lower()
+
+    if arch == "nafnet":
+        from models.nafnet import NAFNet
+        model = NAFNet(
+            in_channels=ck.get("in_channels", 3),
+            out_channels=ck.get("out_channels", 3),
+            width=ck.get("width", 32),
+            middle_blk_num=ck.get("middle_blk_num", 12),
+            enc_blk_nums=ck.get("enc_blk_nums", [2, 2, 4, 8]),
+            dec_blk_nums=ck.get("dec_blk_nums", [2, 2, 2, 2]),
+            use_residual=ck.get("use_residual", True),
+            residual_start=ck.get("residual_start", 0),
+        ).to(device)
+    else:
+        model = RestormerStage2(
+            in_channels=3, out_channels=3,
+            dim=48, num_blocks=[4, 6, 6, 8],
+            num_refinement_blocks=4, use_residual=False,
+        ).to(device)
+
+    # Prefer EMA weights if present
     if ck.get("ema_state_dict"):
         ema = ck["ema_state_dict"]
         sd = ema["shadow"] if isinstance(ema, dict) and "shadow" in ema else ema
@@ -328,7 +351,8 @@ def load_stage2(ckpt: Path, device):
     sd = {k: v for k, v in sd.items() if k in model.state_dict()}
     model.load_state_dict(sd, strict=False)
     model.eval()
-    print(f"  loaded {ckpt.name} ({len(sd)} keys) ep={ck.get('epoch')}", flush=True)
+    print(f"  loaded {ckpt.name} arch={arch} ({len(sd)} keys) ep={ck.get('epoch')} "
+          f"metrics={ck.get('metrics')}", flush=True)
     return model
 
 
