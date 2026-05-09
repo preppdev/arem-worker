@@ -475,6 +475,11 @@ def process_shoot(raw_dir: Path, out_dir: Path,
     n_int = n_ext = 0
     grand_t0 = time.time()
 
+    # Reset CUDA peak after model loads so we measure inference-time peak,
+    # which is the relevant number for "could we infer at higher resolution?"
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
     for ti, (under, mid, over) in enumerate(triplets, 1):
         stem = mid.stem
         t0 = time.time()
@@ -550,6 +555,13 @@ def process_shoot(raw_dir: Path, out_dir: Path,
     meta["wall_min"] = round((time.time() - grand_t0) / 60, 1)
     meta["n_int"] = n_int
     meta["n_ext"] = n_ext
+    if torch.cuda.is_available():
+        meta["peak_vram_gb"] = round(torch.cuda.max_memory_allocated() / 1e9, 2)
+        try:
+            free, total = torch.cuda.mem_get_info()
+            meta["gpu_total_gb"] = round(total / 1e9, 2)
+        except Exception:
+            pass
     with open(out_dir / "_meta.json", "w") as fh:
         json.dump(meta, fh, indent=2)
     print(f"\nshoot done: {n_int} int + {n_ext} ext  wall: {meta['wall_min']} min",

@@ -334,21 +334,26 @@ def process_job(job: dict) -> dict:
             if r.returncode != 0:
                 log(f"    diag: stage1 upload rc={r.returncode}: {r.stderr[-200:]}")
 
-    # Read _meta.json from the inference step to surface grouping failures.
-    # Each anchor that couldn't be paired into a complete bracket is a
-    # data-hygiene issue the photographer / labeler should look at.
+    # Read _meta.json from the inference step to surface grouping failures
+    # and peak VRAM. Each anchor that couldn't be paired is a data-hygiene
+    # issue. Peak VRAM tells us how much sensor-resolution headroom we have.
     import json as _json
     grouping_warnings: list[dict] = []
+    peak_vram_gb: float | None = None
+    gpu_total_gb: float | None = None
     meta_path = pred_root / "_meta.json"
     if meta_path.is_file():
         try:
             meta = _json.loads(meta_path.read_text())
             grouping_warnings = meta.get("group_failures", []) or []
+            peak_vram_gb = meta.get("peak_vram_gb")
+            gpu_total_gb = meta.get("gpu_total_gb")
         except Exception:
             pass
 
     runtime_sec = round(time.time() - t0, 1)
-    log(f"  done. {n_jpg} JPGs in {runtime_sec}s; {len(grouping_warnings)} grouping warnings")
+    log(f"  done. {n_jpg} JPGs in {runtime_sec}s; {len(grouping_warnings)} grouping warnings"
+        + (f"; peak_vram={peak_vram_gb} GB / {gpu_total_gb} GB" if peak_vram_gb else ""))
 
     # Cleanup local scratch — keep raws if it failed earlier (won't reach here)
     try:
@@ -364,6 +369,8 @@ def process_job(job: dict) -> dict:
         "rawSubfolder": raw_subfolder,
         "outputFolder": f"{stored_path}/{DROPBOX_OUTPUT_FOLDER}",
         "groupingWarnings": grouping_warnings,
+        "peakVramGb": peak_vram_gb,
+        "gpuTotalGb": gpu_total_gb,
     }
 
 
