@@ -351,6 +351,7 @@ def load_stage2(ckpt: Path, device):
     sd = {k: v for k, v in sd.items() if k in model.state_dict()}
     model.load_state_dict(sd, strict=False)
     model.eval()
+    model._arch = arch
     print(f"  loaded {ckpt.name} arch={arch} ({len(sd)} keys) ep={ck.get('epoch')} "
           f"metrics={ck.get('metrics')}", flush=True)
     return model
@@ -390,23 +391,22 @@ def stage2_infer(model, jpg_path: Path, out_path: Path, device,
     w16 = (w // 16) * 16
     img = img[:h16, :w16]
 
-    # 16 MP single-pass: A6000 (48 GB) handles 12-16 MP comfortably with the
-    # _safe_depthwise_3x3 wrapper in models/restormer.py spatially chunking
-    # any depthwise tensor that would exceed PyTorch's int32 indexing limit.
-    # The old 8 MP threshold was for the 24 GB 3090; on serverless A6000 it
-    # was forcing every 12 MP shoot through tiling and producing seam-pattern
-    # artifacts that look like the "same tiling" Jordan saw.
+    arch = getattr(model, "_arch", "restormer")
+    # Single-pass only (no tiling). NAFNet runs under bf16 autocast — no MDTA
+    # softmax to break, ~halves activation memory and avoids the OOM that
+    # killed prod jobs on 2026-05-09 (w32 fp32 single-pass at 12 MP needs ~40
+    # GB and collides with Stage 1 + classifier + both Stage 2 models resident).
+    # Restormer stays in fp32 to avoid the FFT-confirmed horizontal-stripe
+    # periodic texture from MDTA channel-softmax saturating under fp16.
     if h16 * w16 <= 16 * 1024 * 1024:
         x = torch.from_numpy(img.astype(np.float32)).permute(2, 0, 1).unsqueeze(0) / 255.0
         x = x.to(device)
-        # Restormer in fp32 (no autocast). MDTA's channel-softmax saturates
-        # under fp16 autocast and produces a horizontal-stripe periodic
-        # texture (FFT-confirmed 2026-05-05: pure-horizontal peaks at 8/16/32 px,
-        # 80-170× background, on residual S2-S1). NAFNet Stage 1 has no
-        # softmax-attention so fp16 stays safe there. A6000 48 GB has the
-        # headroom for fp32 single-pass at 16 MP.
         with torch.no_grad():
-            y = model(x)
+            if arch == "nafnet":
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    y = model(x)
+            else:
+                y = model(x)
         y = torch.clamp(y, 0, 1)
         out = (y.squeeze(0).float().cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
         Image.fromarray(out).save(out_path, quality=quality)
@@ -414,39 +414,10 @@ def stage2_infer(model, jpg_path: Path, out_path: Path, device,
             torch.cuda.empty_cache()
         return h16, w16
 
-    out = np.zeros((h16, w16, 3), dtype=np.float32)
-    weight = np.zeros((h16, w16), dtype=np.float32)
-    step = tile - overlap
-    feather = np.ones(tile, dtype=np.float32)
-    if overlap > 0:
-        ramp = np.linspace(0, 1, overlap, endpoint=False, dtype=np.float32)
-        feather[:overlap] = ramp
-        feather[-overlap:] = ramp[::-1]
-    win = (feather[:, None] * feather[None, :]).astype(np.float32)
-    ys = list(range(0, max(h16 - tile, 0) + 1, step))
-    if not ys or ys[-1] != h16 - tile:
-        ys.append(max(h16 - tile, 0))
-    xs = list(range(0, max(w16 - tile, 0) + 1, step))
-    if not xs or xs[-1] != w16 - tile:
-        xs.append(max(w16 - tile, 0))
-    for y0 in ys:
-        for x0 in xs:
-            patch = img[y0:y0 + tile, x0:x0 + tile]
-            xt = torch.from_numpy(patch.astype(np.float32)).permute(2, 0, 1).unsqueeze(0) / 255.0
-            xt = xt.to(device)
-            # fp32 — see fp16 / MDTA-softmax note in single-pass branch above.
-            with torch.no_grad():
-                yt = model(xt)
-            yt = torch.clamp(yt, 0, 1)
-            pred = yt.squeeze(0).float().cpu().permute(1, 2, 0).numpy()
-            out[y0:y0 + tile, x0:x0 + tile] += pred * win[:, :, None]
-            weight[y0:y0 + tile, x0:x0 + tile] += win
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-    out /= np.maximum(weight[:, :, None], 1e-8)
-    out = (np.clip(out, 0, 1) * 255).astype(np.uint8)
-    Image.fromarray(out).save(out_path, quality=quality)
-    return h16, w16
+    raise RuntimeError(
+        f"stage2: image {h16}×{w16}={h16*w16/1e6:.1f}MP exceeds 16MP single-pass cap "
+        f"and tiling is disabled. Lower MAX_MP upstream or revisit the cap."
+    )
 
 
 # -------- main: process one shoot --------
