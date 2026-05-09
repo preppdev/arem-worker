@@ -40,8 +40,8 @@ ENV AREM_REPO=/workspace/pipeline \
     CLASSIFIER_PATH=/workspace/pipeline/classifier_v2.pth
 
 ENV CHECKPOINT_STAGE1=/workspace/checkpoints/stage1_jxl_v1_best_lpips.pth \
-    CHECKPOINT_INTERIOR=/workspace/checkpoints/interior_full_v1_latest.pth \
-    CHECKPOINT_EXTERIOR=/workspace/checkpoints/exterior_full_v1_latest.pth \
+    CHECKPOINT_INTERIOR=/workspace/checkpoints/may26_interior_w32_b4_4gpu_ep35_inference.pth \
+    CHECKPOINT_EXTERIOR=/workspace/checkpoints/may26_exterior_w32_b4_4gpu_ep29_inference.pth \
     CHECKPOINT_R2_PREFIX=r2:arem-training-data/checkpoints
 
 # Worker code + handler

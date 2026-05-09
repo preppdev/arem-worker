@@ -41,10 +41,10 @@ fetch() {
 }
 fetch "r2:arem-training-data/checkpoints/stage1_jxl_full_v1/best_lpips.pth" \
       "/workspace/checkpoints/stage1_jxl_v1_best_lpips.pth"
-fetch "r2:arem-training-data/checkpoints/interior_full_v1/latest.pth" \
-      "/workspace/checkpoints/interior_full_v1_latest.pth"
-fetch "r2:arem-training-data/checkpoints/exterior_full_v1/latest.pth" \
-      "/workspace/checkpoints/exterior_full_v1_latest.pth"
+fetch "r2:arem-training-data/models/stage2/may26_interior_w32_b4_4gpu_ep35_inference.pth" \
+      "/workspace/checkpoints/may26_interior_w32_b4_4gpu_ep35_inference.pth"
+fetch "r2:arem-training-data/models/stage2/may26_exterior_w32_b4_4gpu_ep29_inference.pth" \
+      "/workspace/checkpoints/may26_exterior_w32_b4_4gpu_ep29_inference.pth"
 echo "[entrypoint] checkpoints ready"
 
 exec python -u /workspace/handler.py
