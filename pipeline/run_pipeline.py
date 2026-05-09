@@ -72,7 +72,7 @@ def parse_ev(s):
 # extension of the first matching file.
 ARW_RE = re.compile(r"^DSC(\d{4,5})\.(ARW|JPG|JPEG|TIF|TIFF|PNG|JXL|WEBP)$",
                     re.IGNORECASE)
-MAX_MP = 12.0
+MAX_MP = float(os.environ.get("MAX_MP_OVERRIDE", "12.0"))
 
 
 # -------- bracket grouping --------
@@ -413,7 +413,10 @@ def stage2_infer(model, jpg_path: Path, out_path: Path, device,
     # (model already cast in load_stage2). Restormer stays fp32 — its MDTA
     # channel-softmax saturates under half precision and produces an
     # FFT-confirmed horizontal-stripe periodic texture.
-    if h16 * w16 <= 16 * 1024 * 1024:
+    # Cap derives from MAX_MP (single-pass only, no tiling). +5% slack accounts
+    # for the 16-pixel alignment rounding pushing dims slightly past the cap.
+    cap_px = int(MAX_MP * 1.05 * 1024 * 1024)
+    if h16 * w16 <= cap_px:
         x = torch.from_numpy(img.astype(np.float32)).permute(2, 0, 1).unsqueeze(0) / 255.0
         if arch == "nafnet":
             x = x.to(device, dtype=torch.bfloat16)
@@ -430,8 +433,8 @@ def stage2_infer(model, jpg_path: Path, out_path: Path, device,
         return h16, w16
 
     raise RuntimeError(
-        f"stage2: image {h16}×{w16}={h16*w16/1e6:.1f}MP exceeds 16MP single-pass cap "
-        f"and tiling is disabled. Lower MAX_MP upstream or revisit the cap."
+        f"stage2: image {h16}×{w16}={h16*w16/1e6:.1f}MP exceeds MAX_MP={MAX_MP} cap "
+        f"and tiling is disabled. Raise MAX_MP_OVERRIDE or revisit the cap."
     )
 
 
