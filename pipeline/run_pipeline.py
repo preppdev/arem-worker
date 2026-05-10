@@ -492,7 +492,7 @@ def process_shoot(raw_dir: Path, out_dir: Path,
     if group_failures:
         print(f"  ⚠ {len(group_failures)} grouping failures:", flush=True)
         for f in group_failures[:10]:
-            print(f"    - {f['anchor']} (EV={f['ev']}): {f['reason']}", flush=True)
+            print(f"    - {f['window']} (EVs={f['evs']}): {f['reason']}", flush=True)
         if len(group_failures) > 10:
             print(f"    ... and {len(group_failures)-10} more", flush=True)
 
