@@ -250,24 +250,40 @@ def run_upright(pred_dir: Path, upright_root: Path, raw_dir: Path) -> Path:
         n_in += 1
     if n_in == 0:
         # Surface why the pipeline produced no output. run_pipeline.py
-        # writes _meta.json with skip reasons (e.g. lens_excluded for
-        # FE 12-24mm GM — no lensfun profile available).
+        # writes _meta.json with both per-triplet skip reasons (e.g.
+        # lens_excluded, demosaic_fail) and group-grouping failures
+        # (e.g. no valid bracket window). Either path produces 0 JPGs;
+        # show whichever bucket has data so the dashboard error category
+        # is actually actionable.
         import json as _json
         meta_path = pred_dir.parent / "_meta.json"
-        skip_summary = ""
+        diag = ""
+        n_arws = n_triplets = 0
         if meta_path.is_file():
             try:
                 meta = _json.loads(meta_path.read_text())
+                n_arws = meta.get("n_arws", 0)
+                n_triplets = meta.get("n_triplets", 0)
+                from collections import Counter
                 skips = [t.get("skip", "") for t in meta.get("triplets", []) if t.get("skip")]
                 if skips:
-                    from collections import Counter
-                    counts = Counter(skips)
-                    skip_summary = "; ".join(f"{c}× {r}" for r, c in counts.most_common())
+                    c = Counter(skips)
+                    diag = "; ".join(f"{n}× {r}" for r, n in c.most_common())
+                else:
+                    grp = meta.get("group_failures", [])
+                    if grp:
+                        c = Counter(g.get("reason", "?") for g in grp)
+                        diag = "no valid brackets — " + "; ".join(
+                            f"{n}× {r}" for r, n in c.most_common())
             except Exception:
                 pass
-        msg = f"no predicted JPGs — every triplet was skipped/failed."
-        if skip_summary:
-            msg += f" Reasons: {skip_summary}"
+        if n_triplets == 0:
+            msg = (f"no triplets formed from {n_arws} input files; "
+                   f"check shooting order / EXIF EV tags")
+        else:
+            msg = "no predicted JPGs — every triplet was skipped/failed"
+        if diag:
+            msg += f" ({diag})"
         raise RuntimeError(msg)
 
     cmd = [PYTHON_BIN, str(UPRIGHT_REPO / "auto_upright.py"),
