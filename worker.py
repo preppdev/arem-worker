@@ -345,20 +345,6 @@ def process_job(job: dict) -> dict:
     log(f"  [4/4] uploading to {DROPBOX_OUTPUT_FOLDER}")
     n_jpg = upload_outputs(upright_dir, dropbox_path)
 
-    # Diagnostic: also upload Stage 1 outputs to <output>/stage1/ when
-    # UPLOAD_STAGE1_DIAG=1. Used to isolate which inference stage produces
-    # high-res artifacts (NAFNet vs Restormer).
-    if os.environ.get("UPLOAD_STAGE1_DIAG", "") in ("1", "true", "yes"):
-        stage1_local = pred_root / "stage1"
-        if stage1_local.is_dir():
-            dst = f"{dropbox_path}/{DROPBOX_OUTPUT_FOLDER}/stage1"
-            log(f"    diag: uploading {len(list(stage1_local.glob('*.jpg')))} stage1 JPGs to {dst}")
-            r = rclone(["copy", str(stage1_local), dst,
-                        "--include", "*.jpg",
-                        "--transfers", "8", "--progress=false"])
-            if r.returncode != 0:
-                log(f"    diag: stage1 upload rc={r.returncode}: {r.stderr[-200:]}")
-
     # Read _meta.json from the inference step to surface grouping failures
     # and peak VRAM. Each anchor that couldn't be paired is a data-hygiene
     # issue. Peak VRAM tells us how much sensor-resolution headroom we have.
