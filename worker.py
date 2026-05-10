@@ -132,10 +132,17 @@ def rclone(args: list[str], timeout: int = 1800) -> subprocess.CompletedProcess:
 
 
 # ---- pipeline steps ----
-RAW_SUBFOLDER_CANDIDATES = ["01-RAW-Photos", "01-RAW-Files"]
-# Image formats we accept as bracket inputs. Raw formats hit rawpy + lensfun;
-# everything else gets decoded directly via PIL (lens correction skipped).
-ACCEPTED_EXTS = ["ARW", "arw", "JPG", "jpg", "JPEG", "jpeg",
+# All AREM shoots use this fixed folder structure; we no longer try
+# fallback names. If a folder doesn't have 01-RAW-Photos/, that's a data
+# problem to surface — not a routing question.
+RAW_SUBFOLDER = "01-RAW-Photos"
+# Image formats we accept as bracket inputs. RAW formats hit rawpy +
+# lensfun (Sony ARW, Nikon NEF, Canon CR2/CR3, plus generic DNG/RAF/RW2).
+# Everything else (JPG/JPEG/TIFF/PNG/JXL/WEBP) gets decoded directly via
+# PIL (lens correction skipped — the in-camera JPG already has it baked).
+ACCEPTED_EXTS = ["ARW", "arw", "NEF", "nef", "CR2", "cr2", "CR3", "cr3",
+                 "DNG", "dng", "RAF", "raf", "RW2", "rw2",
+                 "JPG", "jpg", "JPEG", "jpeg",
                  "TIF", "tif", "TIFF", "tiff", "PNG", "png",
                  "JXL", "jxl", "WEBP", "webp"]
 
@@ -148,33 +155,35 @@ def _include_flags(exts: list[str]) -> list[str]:
 
 
 def download_raws(dropbox_remote_path: str, local_raw_dir: Path) -> tuple[int, int, str]:
-    """Pull the RAW folder contents to local. Returns (file_count, bytes, used_subfolder).
+    """Pull RAW_SUBFOLDER contents to local. Returns (file_count, bytes, used_subfolder).
 
-    Accepts any standard image format (ARW + JPG + TIFF + PNG + JXL + WEBP).
-    Tries known RAW subfolder names in order; uses whichever exists.
+    AREM shoots have a fixed structure — `01-RAW-Photos/` always exists on
+    a real shoot. Missing or empty means the photographer hasn't finished
+    uploading; that's a data state to report up, not a path to retry.
     """
     local_raw_dir.mkdir(parents=True, exist_ok=True)
     include_flags = _include_flags(ACCEPTED_EXTS)
-    last_err = ""
-    for candidate in RAW_SUBFOLDER_CANDIDATES:
-        src = f"{dropbox_remote_path}/{candidate}"
-        ls = rclone(["lsf", src, *include_flags], timeout=60)
-        if ls.returncode != 0 or not ls.stdout.strip():
-            last_err = f"{candidate}: rc={ls.returncode} {ls.stderr[-200:]}"
-            continue
-        r = rclone(["copy", src, str(local_raw_dir),
-                    *include_flags,
-                    "--transfers", "8", "--checkers", "16",
-                    "--progress=false"])
-        if r.returncode != 0:
-            raise RuntimeError(f"rclone copy failed rc={r.returncode}: {r.stderr[-300:]}")
-        files = []
-        for ext in ACCEPTED_EXTS:
-            files += list(local_raw_dir.glob(f"*.{ext}"))
-        total = sum(p.stat().st_size for p in files)
-        return len(files), total, candidate
-    raise RuntimeError(f"no input images found under {dropbox_remote_path} "
-                       f"(tried {RAW_SUBFOLDER_CANDIDATES}); last error: {last_err}")
+    src = f"{dropbox_remote_path}/{RAW_SUBFOLDER}"
+    ls = rclone(["lsf", src, *include_flags], timeout=60)
+    if ls.returncode != 0:
+        raise RuntimeError(
+            f"{RAW_SUBFOLDER} not found under {dropbox_remote_path} "
+            f"(rc={ls.returncode}): {ls.stderr[-200:]}")
+    if not ls.stdout.strip():
+        raise RuntimeError(
+            f"{RAW_SUBFOLDER} is empty (no files matching {ACCEPTED_EXTS}) "
+            f"under {dropbox_remote_path} — shoot upload may be incomplete")
+    r = rclone(["copy", src, str(local_raw_dir),
+                *include_flags,
+                "--transfers", "8", "--checkers", "16",
+                "--progress=false"])
+    if r.returncode != 0:
+        raise RuntimeError(f"rclone copy failed rc={r.returncode}: {r.stderr[-300:]}")
+    files = []
+    for ext in ACCEPTED_EXTS:
+        files += list(local_raw_dir.glob(f"*.{ext}"))
+    total = sum(p.stat().st_size for p in files)
+    return len(files), total, RAW_SUBFOLDER
 
 
 def run_inference(local_raw_dir: Path, pred_root: Path) -> Path:

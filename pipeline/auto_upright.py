@@ -306,13 +306,15 @@ def upright_one(img_path: Path, out_path: Path,
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_rgb = cv2.cvtColor(out_img, cv2.COLOR_BGR2RGB)
 
-    # Look up source file for EXIF passthrough. ARW preferred, but accept
-    # JPG/TIFF/JXL too — exifread reads EXIF identically across formats
-    # and shoots may come in as standard images now.
+    # Look up source file for EXIF passthrough. RAW preferred (any vendor),
+    # but accept JPG/TIFF/JXL too — exifread reads EXIF identically across
+    # formats and shoots may come in as standard images now.
     mid_stem = out_path.stem
     shoot = out_path.parent.name
     arw_path = None
-    for ext in ("ARW", "arw", "JPG", "jpg", "JPEG", "jpeg",
+    for ext in ("ARW", "arw", "NEF", "nef", "CR2", "cr2", "CR3", "cr3",
+                "DNG", "dng", "RAF", "raf", "RW2", "rw2",
+                "JPG", "jpg", "JPEG", "jpeg",
                 "TIF", "tif", "TIFF", "tiff", "JXL", "jxl"):
         if ARW_FLAT:
             cand = arw_root / f"{mid_stem}.{ext}"

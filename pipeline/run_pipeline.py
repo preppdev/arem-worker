@@ -66,12 +66,17 @@ def parse_ev(s):
     except ValueError: return None
 
 
-# Accept Sony ARW + standard image formats (JPG/JPEG/TIFF/PNG/JXL/WEBP).
-# All bracket frames within a single shoot must be the same format —
-# we don't fuse e.g. one ARW with two JPGs. Format is inferred from the
-# extension of the first matching file.
-ARW_RE = re.compile(r"^DSC(\d{4,5})\.(ARW|JPG|JPEG|TIF|TIFF|PNG|JXL|WEBP)$",
-                    re.IGNORECASE)
+# Accept Sony ARW, Nikon NEF, Canon CR2/CR3 (+ generic DNG/RAF/RW2) and
+# standard image formats (JPG/JPEG/TIFF/PNG/JXL/WEBP). Filename prefix is
+# permissive: matches DSC#####, DSC_####, IMG_####, _MG_####, etc — the
+# bracket key is the trailing 4–5 digits, which all three vendors use as
+# the camera-side frame counter. All bracket frames within a single shoot
+# must share a format — we don't fuse e.g. one NEF with two JPGs.
+ARW_RE = re.compile(
+    r"^[A-Z_]*?(\d{4,5})\."
+    r"(ARW|NEF|CR2|CR3|DNG|RAF|RW2|JPG|JPEG|TIF|TIFF|PNG|JXL|WEBP)$",
+    re.IGNORECASE,
+)
 MAX_MP = float(os.environ.get("MAX_MP_OVERRIDE", "12.0"))
 
 
