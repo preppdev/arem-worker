@@ -152,13 +152,12 @@ def read_ev(arw: Path):
     return read_ev_and_time(arw)[0]
 
 
-# Mid-frame anchor: an ARW whose EV bias is within ±1.0 stops of zero is
-# treated as a candidate "mid" of a bracket. From there we check the
-# immediate DSC# neighbors (anchor-1, anchor+1) — those must classify as
-# under (negative EV) and over (positive EV) respectively for a valid
-# triplet. No warmup frames, no fuzzy windows. If the immediate-neighbor
-# rule doesn't hold, the anchor is flagged as a grouping failure for
-# human review, never silently re-paired.
+# Bracket-grouping rule: any 3 consecutive frame-counter values whose EVs
+# form one mid (|EV| ≤ ANCHOR_EV_ABS_MAX), one under (EV < 0), and one
+# over (EV > 0) make a valid triplet, regardless of the in-camera shooting
+# order. Sony AEB writes under→mid→over; Nikon AEB writes mid→under→over;
+# we accept either. Frames once consumed by a triplet are not reused, so
+# overlapping windows can't double-count.
 ANCHOR_EV_ABS_MAX = 1.0
 
 
@@ -166,16 +165,17 @@ def find_triplets(arws: list[Path]) -> tuple[list[tuple[Path, Path, Path]], list
     """Return (triplets, failures).
 
     triplets — list of (under, mid, over) tuples for valid brackets.
-    failures — list of {"anchor", "reason"} dicts for mid candidates
-                that couldn't be paired. Surfaced in _meta.json + the
-                job's errorMessage so humans can fix data hygiene.
+    failures — list of {"window", "reason", "evs"} dicts for 3-frame
+                windows that couldn't form a triplet. Surfaced in
+                _meta.json + the job's errorMessage so humans can fix
+                data hygiene.
     """
     triplets: list[tuple[Path, Path, Path]] = []
     failures: list[dict] = []
     if not arws:
         return triplets, failures
 
-    # Index ARWs by DSC number; read EV once per ARW.
+    # Index frames by counter (DSC# / IMG#); read EV once per frame.
     by_dsc: dict[int, tuple[Path, float | None]] = {}
     for a in arws:
         m = ARW_RE.match(a.name)
@@ -185,44 +185,63 @@ def find_triplets(arws: list[Path]) -> tuple[list[tuple[Path, Path, Path]], list
         ev, _ = read_ev_and_time(a)
         by_dsc[dsc] = (a, ev)
 
-    for dsc in sorted(by_dsc):
-        path, ev = by_dsc[dsc]
-        # Anchor candidate: EV in [-ANCHOR_EV_ABS_MAX, +ANCHOR_EV_ABS_MAX]
-        if ev is None or abs(ev) > ANCHOR_EV_ABS_MAX:
+    sorted_dscs = sorted(by_dsc)
+    consumed: set[int] = set()
+    i = 0
+    while i + 2 < len(sorted_dscs):
+        d0, d1, d2 = sorted_dscs[i], sorted_dscs[i + 1], sorted_dscs[i + 2]
+        if d0 in consumed:
+            i += 1
+            continue
+        # Three consecutive counter values are required — gaps mean
+        # frames were deleted or this isn't a contiguous bracket.
+        if d1 != d0 + 1 or d2 != d1 + 1:
+            i += 1
+            continue
+        f0, f1, f2 = by_dsc[d0], by_dsc[d1], by_dsc[d2]
+        evs = [f0[1], f1[1], f2[1]]
+        window_label = f"{f0[0].name}–{f2[0].name}"
+
+        if any(e is None for e in evs):
+            failures.append({"window": window_label, "evs": evs,
+                             "reason": "EV missing on one or more frames"})
+            i += 1
             continue
 
-        prev = by_dsc.get(dsc - 1)
-        nxt = by_dsc.get(dsc + 1)
-        if prev is None and nxt is None:
-            failures.append({"anchor": path.name, "ev": ev,
-                             "reason": "no immediate DSC# neighbors present"})
+        # Identify roles by EV: most negative is under, most positive is
+        # over, the remaining frame must be the mid (closest to 0).
+        idx_under = min(range(3), key=lambda k: evs[k])
+        idx_over = max(range(3), key=lambda k: evs[k])
+        if idx_under == idx_over:
+            i += 1
             continue
-        if prev is None:
-            failures.append({"anchor": path.name, "ev": ev,
-                             "reason": f"missing DSC{dsc-1} (under candidate)"})
+        idx_mid_set = {0, 1, 2} - {idx_under, idx_over}
+        if len(idx_mid_set) != 1:
+            i += 1
             continue
-        if nxt is None:
-            failures.append({"anchor": path.name, "ev": ev,
-                             "reason": f"missing DSC{dsc+1} (over candidate)"})
+        idx_mid = idx_mid_set.pop()
+
+        if evs[idx_under] >= 0:
+            failures.append({"window": window_label, "evs": evs,
+                             "reason": "no under-exposed frame in window"})
+            i += 1
+            continue
+        if evs[idx_over] <= 0:
+            failures.append({"window": window_label, "evs": evs,
+                             "reason": "no over-exposed frame in window"})
+            i += 1
+            continue
+        if abs(evs[idx_mid]) > ANCHOR_EV_ABS_MAX:
+            failures.append({"window": window_label, "evs": evs,
+                             "reason": f"mid frame EV {evs[idx_mid]} outside "
+                                       f"±{ANCHOR_EV_ABS_MAX}"})
+            i += 1
             continue
 
-        prev_path, prev_ev = prev
-        nxt_path, nxt_ev = nxt
-        if prev_ev is None or nxt_ev is None:
-            failures.append({"anchor": path.name, "ev": ev,
-                             "reason": f"neighbor EV unreadable "
-                                       f"(prev={prev_ev}, next={nxt_ev})"})
-            continue
-        if not (prev_ev < 0):
-            failures.append({"anchor": path.name, "ev": ev,
-                             "reason": f"DSC{dsc-1} not under (EV={prev_ev})"})
-            continue
-        if not (nxt_ev > 0):
-            failures.append({"anchor": path.name, "ev": ev,
-                             "reason": f"DSC{dsc+1} not over (EV={nxt_ev})"})
-            continue
-
-        triplets.append((prev_path, path, nxt_path))
+        frames = [f0[0], f1[0], f2[0]]
+        triplets.append((frames[idx_under], frames[idx_mid], frames[idx_over]))
+        consumed.update([d0, d1, d2])
+        i += 3
 
     return triplets, failures
 
