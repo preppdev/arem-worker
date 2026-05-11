@@ -1,0 +1,14 @@
+# Sudoers rule enabling the host_heartbeat.sh agent (running as jordan)
+# to execute exactly two privileged commands without a password prompt:
+#   - restart the worker systemd service
+#   - reboot the box
+#
+# Install once:
+#   sudo install -m 440 /home/jordan/arem-worker/arem-worker-sudoers \
+#        /etc/sudoers.d/arem-worker
+#   sudo visudo -c               # verify syntax
+#
+# Anything else still requires the normal sudo password.
+
+jordan ALL=(root) NOPASSWD: /bin/systemctl restart arem-worker-local.service
+jordan ALL=(root) NOPASSWD: /sbin/reboot
