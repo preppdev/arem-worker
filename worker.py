@@ -47,6 +47,7 @@ from pathlib import Path
 
 import urllib.request
 import urllib.error
+import urllib.parse
 
 # ---- config ----
 DASHBOARD_URL = os.environ.get("DASHBOARD_URL",
@@ -106,6 +107,54 @@ def claim_job() -> dict | None:
 def post_status(job_id: str, status: str, **fields) -> dict:
     body = {"status": status, **fields}
     return _post(f"/api/jobs/{job_id}/status", body)
+
+
+def _get(path: str) -> dict:
+    url = f"{DASHBOARD_URL}{path}"
+    req = urllib.request.Request(
+        url, method="GET",
+        headers={"x-worker-token": WORKER_TOKEN},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"GET {path} -> HTTP {e.code}: {body_text[:300]}")
+    except Exception as e:
+        raise RuntimeError(f"GET {path} failed: {e}")
+
+
+def _http_download(url: str, dest: Path) -> int:
+    """Stream-download a presigned URL to a local file. Returns bytes."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    req = urllib.request.Request(url, method="GET")
+    total = 0
+    with urllib.request.urlopen(req, timeout=600) as r, dest.open("wb") as fh:
+        while True:
+            chunk = r.read(1024 * 1024)
+            if not chunk:
+                break
+            fh.write(chunk)
+            total += len(chunk)
+    return total
+
+
+def _http_put(url: str, src: Path) -> None:
+    """Stream-upload a local file via PUT to a presigned URL."""
+    size = src.stat().st_size
+    with src.open("rb") as fh:
+        req = urllib.request.Request(
+            url, data=fh.read(), method="PUT",
+            headers={"Content-Length": str(size)},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=600) as r:
+                # Drain to release the connection
+                r.read()
+        except urllib.error.HTTPError as e:
+            body_text = e.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"PUT {url[:80]}... -> HTTP {e.code}: {body_text[:300]}")
 
 
 # ---- Dropbox path resolution ----
@@ -316,12 +365,45 @@ def upload_outputs(local_dir: Path, dropbox_job_path: str) -> int:
     return len(list(local_dir.glob("*.jpg")))
 
 
+def download_manual_inputs(inputs: list[dict], local_raw_dir: Path) -> tuple[int, int]:
+    """Manual-upload ingest: fetch each presigned R2 URL into local_raw_dir.
+
+    inputs: [{ key, name, url }, ...] from claim response.
+    Returns (file_count, total_bytes). Filename comes from `name` so
+    EXIF-driven find_triplets sees the same names the operator dropped.
+    """
+    local_raw_dir.mkdir(parents=True, exist_ok=True)
+    total = 0
+    count = 0
+    for i, item in enumerate(inputs, 1):
+        name = item.get("name") or f"file_{i:04d}"
+        url = item["url"]
+        dest = local_raw_dir / name
+        log(f"  manual: fetch {i}/{len(inputs)} {name}")
+        total += _http_download(url, dest)
+        count += 1
+    return count, total
+
+
+def upload_manual_outputs(local_dir: Path, output_prefix: str) -> tuple[int, list[str]]:
+    """Manual-upload egress: PUT each *.jpg under local_dir to R2 via
+    a presigned URL minted by the dashboard. Returns (count, keys).
+    """
+    jpgs = sorted(local_dir.glob("*.jpg"))
+    keys: list[str] = []
+    for p in jpgs:
+        signed = _get(f"/api/jobs/claim?outputUploadFor={urllib.parse.quote(output_prefix, safe='/')}"
+                      f"&filename={urllib.parse.quote(p.name)}")
+        _http_put(signed["url"], p)
+        keys.append(signed["key"])
+    return len(jpgs), keys
+
+
 # ---- per-job orchestrator ----
 def process_job(job: dict) -> dict:
     job_id = job["id"]
     stored_path = job["dropboxPath"]
-    dropbox_path = resolve_dropbox_source(stored_path)
-    log(f"job {job_id}: {dropbox_path}")
+    manual = job.get("manualUpload")  # None for normal Dropbox jobs
 
     work = WORK_ROOT / job_id
     raw_dir = work / "raws"
@@ -329,12 +411,22 @@ def process_job(job: dict) -> dict:
     upright_root = work / "uprighted"
 
     t0 = time.time()
-    log("  [1/4] downloading ARWs")
-    n_arws, total_bytes, raw_subfolder = download_raws(dropbox_path, raw_dir)
+    if manual:
+        inputs = manual.get("inputs", []) or []
+        log(f"job {job_id}: manual upload, {len(inputs)} files")
+        log("  [1/4] fetching inputs from R2")
+        n_arws, total_bytes = download_manual_inputs(inputs, raw_dir)
+        raw_subfolder = "manual_upload"
+    else:
+        dropbox_path = resolve_dropbox_source(stored_path)
+        log(f"job {job_id}: {dropbox_path}")
+        log("  [1/4] downloading ARWs")
+        n_arws, total_bytes, raw_subfolder = download_raws(dropbox_path, raw_dir)
+
     if n_arws == 0:
-        raise RuntimeError("no ARW files found")
+        raise RuntimeError("no input files found")
     post_status(job_id, "processing", fileCount=n_arws, totalBytes=total_bytes)
-    log(f"    downloaded {n_arws} ARWs from {raw_subfolder} ({total_bytes/1e9:.2f} GB)")
+    log(f"    downloaded {n_arws} inputs from {raw_subfolder} ({total_bytes/1e9:.2f} GB)")
 
     log("  [2/4] inference (rawpy → photomatix → restormer)")
     pred_dir = run_inference(raw_dir, pred_root)
@@ -342,8 +434,14 @@ def process_job(job: dict) -> dict:
     log("  [3/4] auto-upright + EXIF/branding")
     upright_dir = run_upright(pred_dir, upright_root, raw_dir)
 
-    log(f"  [4/4] uploading to {DROPBOX_OUTPUT_FOLDER}")
-    n_jpg = upload_outputs(upright_dir, dropbox_path)
+    if manual:
+        output_prefix = manual.get("outputPrefix") or f"manual_uploads/{job_id}/outputs/"
+        log(f"  [4/4] uploading outputs to R2 ({output_prefix})")
+        n_jpg, output_keys = upload_manual_outputs(upright_dir, output_prefix)
+    else:
+        log(f"  [4/4] uploading to {DROPBOX_OUTPUT_FOLDER}")
+        n_jpg = upload_outputs(upright_dir, dropbox_path)
+        output_keys = None
 
     # Read _meta.json from the inference step to surface grouping failures
     # and peak VRAM. Each anchor that couldn't be paired is a data-hygiene
@@ -372,17 +470,23 @@ def process_job(job: dict) -> dict:
     except Exception:
         pass
 
-    return {
+    result = {
         "jpegCount": n_jpg,
         "rawCount": n_arws,
         "totalBytes": total_bytes,
         "runtimeSec": runtime_sec,
         "rawSubfolder": raw_subfolder,
-        "outputFolder": f"{stored_path}/{DROPBOX_OUTPUT_FOLDER}",
+        "outputFolder": (
+            manual.get("outputPrefix") if manual
+            else f"{stored_path}/{DROPBOX_OUTPUT_FOLDER}"
+        ),
         "groupingWarnings": grouping_warnings,
         "peakVramGb": peak_vram_gb,
         "gpuTotalGb": gpu_total_gb,
     }
+    if manual and output_keys:
+        result["r2OutputKeys"] = output_keys
+    return result
 
 
 def loop_once() -> bool:
