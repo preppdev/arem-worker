@@ -82,30 +82,45 @@ MAX_MP = float(os.environ.get("MAX_MP_OVERRIDE", "12.0"))
 
 # -------- bracket grouping --------
 
-def list_arws(shoot_raw_dir: Path) -> list[Path]:
-    """Return image files in DSC# order. Accepts ARW + standard formats.
+# Recognized image extensions (raw + standard). Files outside this set are
+# ignored at listing time.
+ACCEPTED_EXTS = {".arw", ".nef", ".cr2", ".cr3", ".dng", ".raf", ".rw2",
+                 ".jpg", ".jpeg", ".tif", ".tiff", ".png", ".jxl", ".webp"}
 
-    If both raw and standard files exist with the same DSC#, prefer the
-    raw (rawpy + lensfun gives better quality). If only standard files
-    exist, use those.
+
+def list_arws(shoot_raw_dir: Path) -> list[Path]:
+    """Return image files for triplet detection.
+
+    Includes anything with a recognized image extension. When two files
+    share the same DSC#-style numeric stem (e.g. "DSC02600.ARW" and
+    "DSC02600.JPG"), we prefer the raw; otherwise both files pass
+    through (find_triplets_exif handles deduplication by EXIF). Files
+    with non-DSC filenames (e.g. T-739's "Photo May 04 2026, 11 28 25
+    AM.arw" from the Lightroom Mobile export) used to be silently
+    dropped by ARW_RE; they're now included.
     """
     by_dsc: dict[int, Path] = {}
+    extras: list[Path] = []
     for p in shoot_raw_dir.iterdir():
-        m = ARW_RE.match(p.name)
-        if not m:
+        if not p.is_file():
             continue
-        dsc = int(m.group(1))
         ext = p.suffix.lower()
-        existing = by_dsc.get(dsc)
-        if existing is None:
-            by_dsc[dsc] = p
-        else:
-            # Prefer raw over standard for same DSC#.
-            existing_is_raw = existing.suffix.lower() in RAW_EXTENSIONS
-            new_is_raw = ext in RAW_EXTENSIONS
-            if new_is_raw and not existing_is_raw:
+        if ext not in ACCEPTED_EXTS:
+            continue
+        m = ARW_RE.match(p.name)
+        if m:
+            dsc = int(m.group(1))
+            existing = by_dsc.get(dsc)
+            if existing is None:
                 by_dsc[dsc] = p
-    return [by_dsc[k] for k in sorted(by_dsc)]
+            else:
+                existing_is_raw = existing.suffix.lower() in RAW_EXTENSIONS
+                new_is_raw = ext in RAW_EXTENSIONS
+                if new_is_raw and not existing_is_raw:
+                    by_dsc[dsc] = p
+        else:
+            extras.append(p)
+    return [by_dsc[k] for k in sorted(by_dsc)] + sorted(extras)
 
 
 def read_ev_and_time(arw: Path):
@@ -152,23 +167,44 @@ def read_ev(arw: Path):
     return read_ev_and_time(arw)[0]
 
 
-# Bracket-grouping rule: any 3 consecutive frame-counter values whose EVs
-# form one mid (|EV| ≤ ANCHOR_EV_ABS_MAX), one under (EV < 0), and one
-# over (EV > 0) make a valid triplet, regardless of the in-camera shooting
-# order. Sony AEB writes under→mid→over; Nikon AEB writes mid→under→over;
-# we accept either. Frames once consumed by a triplet are not reused, so
-# overlapping windows can't double-count.
+# Bracket-grouping rule: any 3 frames whose EVs form one mid (|EV| ≤
+# ANCHOR_EV_ABS_MAX), one under (EV < 0), and one over (EV > 0) make a
+# valid triplet, regardless of the in-camera shooting order. Sony AEB
+# writes under→mid→over; Nikon AEB writes mid→under→over; we accept
+# either. Frames once consumed by a triplet are not reused.
 ANCHOR_EV_ABS_MAX = 1.0
+
+# Two frames belong to the same bracket if their EXIF capture times are
+# within this many seconds. Camera AEB fires its 3 or 5 frames within
+# ~1 second; we leave headroom for the buffer-flush pause that some
+# cameras insert between the 3rd and 4th of a 5-shot bracket.
+MAX_BRACKET_GAP_SEC = 3.0
 
 
 def find_triplets(arws: list[Path]) -> tuple[list[tuple[Path, Path, Path]], list[dict]]:
-    """Return (triplets, failures).
+    """Detect bracket triplets. Dispatches between two algorithms:
 
-    triplets — list of (under, mid, over) tuples for valid brackets.
-    failures — list of {"window", "reason", "evs"} dicts for 3-frame
-                windows that couldn't form a triplet. Surfaced in
-                _meta.json + the job's errorMessage so humans can fix
-                data hygiene.
+    - 'exif' (default): EXIF-time-driven clustering with EV-role
+      selection. Handles non-DSC filenames (Lightroom Mobile,
+      Dropbox-renamed "(1)" files), 5-frame AEB (picks the central
+      -2/0/+2 sub-triplet), and duplicate uploads by deduping on
+      (capture_time_with_subsec, EV).
+
+    - 'dsc' (legacy fallback): the original DSC#-sequenced 3-frame
+      sliding-window detector. Available via FIND_TRIPLETS_MODE=dsc
+      env var in case the exif version misbehaves.
+
+    Both return (triplets, failures) with the same shape.
+    """
+    mode = os.environ.get("FIND_TRIPLETS_MODE", "exif").lower()
+    if mode == "dsc":
+        return find_triplets_dsc(arws)
+    return find_triplets_exif(arws)
+
+
+def find_triplets_dsc(arws: list[Path]) -> tuple[list[tuple[Path, Path, Path]], list[dict]]:
+    """Legacy DSC#-driven detector. Kept for fallback via
+    FIND_TRIPLETS_MODE=dsc. Behavior unchanged from pre-2026-05-11.
     """
     triplets: list[tuple[Path, Path, Path]] = []
     failures: list[dict] = []
@@ -243,6 +279,120 @@ def find_triplets(arws: list[Path]) -> tuple[list[tuple[Path, Path, Path]], list
         consumed.update([d0, d1, d2])
         i += 3
 
+    return triplets, failures
+
+
+def find_triplets_exif(arws: list[Path]) -> tuple[list[tuple[Path, Path, Path]], list[dict]]:
+    """EXIF-driven triplet detection.
+
+    Reads (capture_time_with_subsec, EV, file_size) per file, dedupes
+    exact duplicates by (time, EV), clusters surviving frames into
+    time-bounded brackets, then picks one valid (under, mid, over)
+    triplet per cluster — preferring frames closest to the EV-role
+    boundaries so 5-frame {-4,-2,0,+2,+4} brackets emit the central
+    (-2, 0, +2) sub-triplet instead of the (+4, 0, -4) wrap-around.
+
+    Failures list each cluster that couldn't form a triplet with a
+    plain-English reason.
+    """
+    triplets: list[tuple[Path, Path, Path]] = []
+    failures: list[dict] = []
+    if not arws:
+        return triplets, failures
+
+    # Phase 1: per-file metadata
+    items: list[dict] = []
+    missing: list[dict] = []
+    for a in arws:
+        ev, t = read_ev_and_time(a)
+        try:
+            size = a.stat().st_size
+        except OSError:
+            size = 0
+        if ev is None or t is None:
+            missing.append({
+                "window": a.name,
+                "evs": [ev],
+                "reason": f"EXIF {'EV' if ev is None else 'DateTimeOriginal'} missing",
+            })
+            continue
+        items.append({"path": a, "ev": ev, "t": t, "size": size, "name": a.name})
+
+    # Phase 2: dedupe — identical (time, EV) means same shutter press
+    # stored twice (e.g. re-uploaded card). Prefer raw over standard
+    # JPG, then prefer the file whose name doesn't carry a Dropbox-style
+    # " (1)" rename suffix.
+    def dup_score(it: dict) -> tuple[int, int, int]:
+        is_raw = it["path"].suffix.lower() in RAW_EXTENSIONS
+        has_dup_suffix = 1 if re.search(r"\s\(\d+\)\.[A-Za-z0-9]+$", it["name"]) else 0
+        # Higher tuple wins; we want raw > non-raw, no-suffix > suffix, larger > smaller
+        return (1 if is_raw else 0, 1 - has_dup_suffix, it["size"])
+
+    by_key: dict[tuple[float, float], dict] = {}
+    dups_dropped = 0
+    for it in items:
+        key = (round(it["t"] * 1000) / 1000.0, round(it["ev"], 3))
+        existing = by_key.get(key)
+        if existing is None or dup_score(it) > dup_score(existing):
+            if existing is not None:
+                dups_dropped += 1
+            by_key[key] = it
+        else:
+            dups_dropped += 1
+    deduped = sorted(by_key.values(), key=lambda x: x["t"])
+    if dups_dropped:
+        print(f"  find_triplets_exif: dropped {dups_dropped} exact duplicate(s)", flush=True)
+
+    # Phase 3: cluster into brackets by time gap
+    clusters: list[list[dict]] = []
+    cur: list[dict] = []
+    for it in deduped:
+        if cur and (it["t"] - cur[-1]["t"]) > MAX_BRACKET_GAP_SEC:
+            clusters.append(cur)
+            cur = []
+        cur.append(it)
+    if cur:
+        clusters.append(cur)
+
+    # Phase 4: pick a valid (under, mid, over) triplet per cluster.
+    for cluster in clusters:
+        window_label = f"{cluster[0]['name']}…{cluster[-1]['name']}"
+        evs = [c["ev"] for c in cluster]
+        if len(cluster) < 3:
+            failures.append({"window": window_label, "evs": evs,
+                             "reason": f"only {len(cluster)} frame(s) in bracket window "
+                                       f"(need ≥ 3)"})
+            continue
+        mids = [c for c in cluster if abs(c["ev"]) <= ANCHOR_EV_ABS_MAX]
+        unders = [c for c in cluster if c["ev"] <= -SIDE_MIN]
+        overs = [c for c in cluster if c["ev"] >= SIDE_MIN]
+        if not mids:
+            failures.append({"window": window_label, "evs": evs,
+                             "reason": f"no mid frame (|EV|≤{ANCHOR_EV_ABS_MAX}) in bracket"})
+            continue
+        if not unders:
+            failures.append({"window": window_label, "evs": evs,
+                             "reason": "no under-exposed frame in bracket"})
+            continue
+        if not overs:
+            failures.append({"window": window_label, "evs": evs,
+                             "reason": "no over-exposed frame in bracket"})
+            continue
+        # Mid: closest to 0. Under: closest to 0 from below (least extreme).
+        # Over: closest to 0 from above. This naturally picks (-2, 0, +2)
+        # from a 5-frame ±4/±2/0 bracket rather than the more-extreme ±4.
+        mid = min(mids, key=lambda c: abs(c["ev"]))
+        under = max(unders, key=lambda c: c["ev"])
+        over = min(overs, key=lambda c: c["ev"])
+        # Belt-and-suspenders: ensure the three are distinct
+        chosen = {id(mid), id(under), id(over)}
+        if len(chosen) != 3:
+            failures.append({"window": window_label, "evs": evs,
+                             "reason": "could not separate roles (same frame for two slots)"})
+            continue
+        triplets.append((under["path"], mid["path"], over["path"]))
+
+    failures.extend(missing)
     return triplets, failures
 
 
