@@ -82,6 +82,17 @@ fi
 echo "[heartbeat] pending action: $PENDING"
 
 case "$PENDING" in
+  report_logs)
+    # Tail the worker's journal and post back in a single combined call.
+    LOGS=$(journalctl -u arem-worker-local --no-pager -n 100 2>/dev/null | tail -c 40000)
+    LOGS_JSON=$(printf '%s' "$LOGS" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
+    curl -s -X POST "${DASHBOARD_URL}/api/internal/heartbeat" \
+      -H "Content-Type: application/json" \
+      -H "x-worker-token: ${WORKER_TOKEN:-}" \
+      -d "{\"workerId\":\"${WORKER_ID}\",\"metadata\":${METADATA},\"executedAction\":\"report_logs\",\"logs\":${LOGS_JSON}}" \
+      --max-time 15 >/dev/null || true
+    exit 0
+    ;;
   restart_worker)
     sudo /bin/systemctl restart arem-worker-local.service
     EXECUTED="restart_worker"
