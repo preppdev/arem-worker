@@ -1,0 +1,23 @@
+# Fires arem-host-heartbeat.service once per minute. The dashboard
+# /workers page treats any host-* worker that hasn't pinged in > 3 min
+# as offline.
+#
+# Install:
+#   sudo cp arem-host-heartbeat.{service,timer} /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now arem-host-heartbeat.timer
+# Check:
+#   systemctl list-timers arem-host-heartbeat
+
+[Unit]
+Description=Run AREM host heartbeat once per minute
+Requires=arem-host-heartbeat.service
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+Unit=arem-host-heartbeat.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,30 @@
+# systemd unit for the local 3090 worker.
+# Install: sudo cp arem-worker-local.service /etc/systemd/system/ \
+#       && sudo systemctl daemon-reload \
+#       && sudo systemctl enable --now arem-worker-local.service
+# View logs: journalctl -u arem-worker-local -f
+# Restart:   sudo systemctl restart arem-worker-local
+# Stop:      sudo systemctl stop arem-worker-local
+
+[Unit]
+Description=AREM local 3090 worker (hybrid; absorbs steady-state queue)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jordan
+Group=jordan
+WorkingDirectory=/home/jordan/arem-worker
+ExecStart=/bin/bash /home/jordan/arem-worker/run_local.sh
+Restart=on-failure
+RestartSec=10
+# Don't leak the worker if the box is under memory pressure.
+KillMode=mixed
+TimeoutStopSec=120
+# Pipe stdout to journalctl.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

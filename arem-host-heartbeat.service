@@ -1,0 +1,13 @@
+# One-shot service invoked by arem-host-heartbeat.timer once per minute.
+# Reports host health to the dashboard /api/internal/heartbeat endpoint.
+
+[Unit]
+Description=AREM host heartbeat (reports box health to dashboard)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=jordan
+Group=jordan
+ExecStart=/bin/bash /home/jordan/arem-worker/host_heartbeat.sh
