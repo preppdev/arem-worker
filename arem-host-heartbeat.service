@@ -1,5 +1,10 @@
 # One-shot service invoked by arem-host-heartbeat.timer once per minute.
 # Reports host health to the dashboard /api/internal/heartbeat endpoint.
+#
+# Install (same as arem-worker-local.service — share /etc/arem-worker.env):
+#   sudo cp arem-host-heartbeat.{service,timer} /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now arem-host-heartbeat.timer
 
 [Unit]
 Description=AREM host heartbeat (reports box health to dashboard)
@@ -7,6 +12,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+# Persistent env file (see arem-worker-local.service header for install).
+EnvironmentFile=-/etc/arem-worker.env
 Type=oneshot
 User=jordan
 Group=jordan
