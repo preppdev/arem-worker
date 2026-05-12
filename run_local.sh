@@ -12,14 +12,18 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# Load credentials from the existing prod env pull
-if [ ! -f /tmp/vercel-prod.env ]; then
-  echo "Missing /tmp/vercel-prod.env — run 'vercel env pull /tmp/vercel-prod.env --environment=production --yes' first"
-  exit 1
+# Load credentials. When invoked via systemd's arem-worker-local.service,
+# EnvironmentFile=/etc/arem-worker.env already injects these into the
+# process env, so the sources below are no-ops. For manual
+# `bash run_local.sh` invocations, prefer /etc/arem-worker.env (survives
+# reboot — /tmp is tmpfs) over the legacy /tmp/vercel-prod.env path.
+if [ -f /etc/arem-worker.env ]; then
+  set -a; source /etc/arem-worker.env; set +a
+elif [ -f /tmp/vercel-prod.env ]; then
+  set -a; source /tmp/vercel-prod.env; set +a
 fi
-set -a
-source /tmp/vercel-prod.env
-set +a
+# Sanity check the bare-minimum required vars. Empty/unset = abort.
+: "${WORKER_TOKEN:?WORKER_TOKEN not set — install /etc/arem-worker.env (see arem-worker-local.service header) or 'vercel env pull /tmp/vercel-prod.env --environment=production --yes' first}"
 
 # Worker config
 export DASHBOARD_URL="${DASHBOARD_URL:-https://arem-editing-dashboard.vercel.app}"

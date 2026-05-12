@@ -9,11 +9,14 @@
 
 set -euo pipefail
 
-# Load creds (WORKER_TOKEN, DASHBOARD_URL)
-if [ -f /tmp/vercel-prod.env ]; then
-  set -a
-  source /tmp/vercel-prod.env
-  set +a
+# Load creds (WORKER_TOKEN, DASHBOARD_URL). When invoked via systemd's
+# arem-host-heartbeat.service, EnvironmentFile=/etc/arem-worker.env
+# already injects these. The sources below cover manual invocation;
+# prefer the persistent /etc/ location over the legacy tmpfs /tmp/ one.
+if [ -f /etc/arem-worker.env ]; then
+  set -a; source /etc/arem-worker.env; set +a
+elif [ -f /tmp/vercel-prod.env ]; then
+  set -a; source /tmp/vercel-prod.env; set +a
 fi
 
 DASHBOARD_URL="${DASHBOARD_URL:-https://arem-editing-dashboard.vercel.app}"
@@ -34,6 +37,17 @@ if command -v nvidia-smi >/dev/null 2>&1; then
     --query-gpu=temperature.gpu,memory.used,memory.total,utilization.gpu \
     --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ' | tr ',' ' ' || echo)
 fi
+
+# Defensive: when the nvidia kernel module is loaded but the driver fails
+# to talk to the GPU (e.g. post-reboot module-version mismatch), nvidia-smi
+# emits an English error sentence to stdout instead of numbers. Without
+# this guard those words get interpolated unquoted into the JSON below,
+# the dashboard's req.json() returns null, and the heartbeat silently
+# fails to land in the DB. Numeric-validate each value or zero it out.
+[[ "$GPU_TEMP"          =~ ^[0-9]+$ ]] || GPU_TEMP=""
+[[ "$GPU_MEM_USED_MB"   =~ ^[0-9]+$ ]] || GPU_MEM_USED_MB=""
+[[ "$GPU_MEM_TOTAL_MB"  =~ ^[0-9]+$ ]] || GPU_MEM_TOTAL_MB=""
+[[ "$GPU_UTIL"          =~ ^[0-9]+$ ]] || GPU_UTIL=""
 
 METADATA=$(cat <<EOF
 {

@@ -1,7 +1,12 @@
 # systemd unit for the local 3090 worker.
-# Install: sudo cp arem-worker-local.service /etc/systemd/system/ \
-#       && sudo systemctl daemon-reload \
-#       && sudo systemctl enable --now arem-worker-local.service
+# Install:
+#   # Persist the worker's env (survives reboot, unlike /tmp/vercel-prod.env
+#   # which is on tmpfs and wiped on every boot):
+#   sudo install -m 0640 -o jordan -g jordan \
+#        /tmp/vercel-prod.env /etc/arem-worker.env
+#   sudo cp arem-worker-local.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now arem-worker-local.service
 # View logs: journalctl -u arem-worker-local -f
 # Restart:   sudo systemctl restart arem-worker-local
 # Stop:      sudo systemctl stop arem-worker-local
@@ -12,6 +17,9 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+# Persistent env file. Leading `-` means "ok if absent" — useful for the
+# initial bootstrap before /etc/arem-worker.env is installed.
+EnvironmentFile=-/etc/arem-worker.env
 Type=simple
 User=jordan
 Group=jordan
