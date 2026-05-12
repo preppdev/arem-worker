@@ -150,6 +150,104 @@ def host_uptime_sec() -> int:
         return 0
 
 
+def os_pretty_name() -> str:
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if line.startswith("PRETTY_NAME="):
+                    return line.split("=", 1)[1].strip().strip('"')
+    except Exception:
+        pass
+    return "Linux"
+
+
+def kernel_release() -> str:
+    try:
+        return os.uname().release
+    except Exception:
+        return "?"
+
+
+def cpu_model() -> str:
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith("model name"):
+                    name = line.split(":", 1)[1].strip()
+                    # Trim noisy "(R)" / "(TM)" / "CPU @ x.xxGHz" cruft
+                    for s in ("(R)", "(TM)", "CPU "):
+                        name = name.replace(s, "")
+                    return " ".join(name.split())
+    except Exception:
+        pass
+    return "?"
+
+
+def cpu_count() -> int:
+    return os.cpu_count() or 1
+
+
+def load_avg() -> tuple[float, float, float]:
+    try:
+        with open("/proc/loadavg") as f:
+            parts = f.read().split()
+            return float(parts[0]), float(parts[1]), float(parts[2])
+    except Exception:
+        return 0.0, 0.0, 0.0
+
+
+def mem_info_kb() -> dict[str, int]:
+    """Return MemTotal/MemAvailable/SwapTotal/SwapFree in kB."""
+    out: dict[str, int] = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, _, rest = line.partition(":")
+                v = rest.strip().split()
+                if v and v[0].isdigit():
+                    out[k] = int(v[0])
+    except Exception:
+        pass
+    return out
+
+
+def disk_usage(path: str) -> tuple[float, float] | None:
+    """Return (used_gb, total_gb) for the filesystem containing `path`."""
+    try:
+        st = os.statvfs(path)
+        total = st.f_blocks * st.f_frsize
+        free = st.f_bavail * st.f_frsize
+        used = total - free
+        return used / (1024**3), total / (1024**3)
+    except Exception:
+        return None
+
+
+def primary_ipv4s() -> list[tuple[str, str]]:
+    """Return [(iface, cidr), ...] for non-loopback IPv4 interfaces. Uses
+    `ip -4 -o addr show` because reading /proc/net/fib_trie is brittle and
+    `ip` is on every modern Linux."""
+    try:
+        out = subprocess.check_output(
+            ["ip", "-4", "-o", "addr", "show"],
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        ).decode()
+        result: list[tuple[str, str]] = []
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            iface = parts[1]
+            if iface == "lo":
+                continue
+            cidr = parts[3]
+            result.append((iface, cidr))
+        return result
+    except Exception:
+        return []
+
+
 # ── format helpers ──────────────────────────────────────────────────────────
 
 def fmt_age(sec: int) -> str:
@@ -177,6 +275,10 @@ def term_width() -> int:
 
 # ── render ──────────────────────────────────────────────────────────────────
 
+def section(title: str) -> str:
+    return f"{C.BOLD}{C.CYAN}{title}{C.RESET}"
+
+
 def render() -> None:
     hostname = socket.gethostname()
     worker_id_local = f"local-3090-{hostname.split('.')[0]}"
@@ -184,27 +286,98 @@ def render() -> None:
     rule = C.DIM + ("─" * width) + C.RESET
     now_str = datetime.now().strftime("%a %d %b %H:%M:%S")
 
-    # Header
+    # ── HEADER ──
     pad = " " * max(1, width - len(hostname) - len(now_str))
     print(f"{C.BOLD}{C.WHITE}{hostname}{C.RESET}{pad}{C.DIM}{now_str}{C.RESET}")
     print(rule)
 
-    # Worker service + dashboard reach
+    # ── SYSTEM ──
+    uptime = host_uptime_sec()
+    print(section("SYSTEM"))
+    print(
+        f"  {os_pretty_name()} · kernel {kernel_release()} · "
+        f"uptime {fmt_uptime(uptime)}"
+    )
+    ips = primary_ipv4s()
+    if ips:
+        ip_line = "  ·  ".join(
+            f"{C.BOLD}{iface}{C.RESET} {C.WHITE}{cidr}{C.RESET}"
+            for iface, cidr in ips
+        )
+        print(f"  IP: {ip_line}")
+    print()
+
+    # ── HEALTH ──
+    print(section("HEALTH"))
     svc = systemd_active("arem-worker-local")
     svc_color = C.GREEN if svc == "active" else C.RED
-    uptime = host_uptime_sec()
-    print(
-        f"  {svc_color}●{C.RESET} {C.BOLD}WORKER:{C.RESET} {svc:<8}  "
-        f"{C.DIM}(host uptime {fmt_uptime(uptime)}){C.RESET}"
-    )
+    print(f"  {svc_color}●{C.RESET} {C.BOLD}WORKER:{C.RESET}    {svc}")
 
     workers_data = fetch_workers()
     dash_color = C.GREEN if workers_data else C.YELLOW
     dash_text = "reachable" if workers_data else "unreachable"
     print(f"  {dash_color}●{C.RESET} {C.BOLD}DASHBOARD:{C.RESET} {dash_text}")
+    print()
 
-    # GPU
+    # ── CPU ──
+    print(section("CPU"))
+    la = load_avg()
+    nproc = cpu_count()
+    # Color the 1-min load relative to core count: <50% green, <100% yellow, >100% red
+    load_pct = la[0] / nproc if nproc else 0
+    if load_pct < 0.5:
+        load_color = C.GREEN
+    elif load_pct < 1.0:
+        load_color = C.YELLOW
+    else:
+        load_color = C.RED
+    print(
+        f"  load  {load_color}1m {la[0]:.2f}{C.RESET}  "
+        f"5m {la[1]:.2f}  15m {la[2]:.2f}  "
+        f"{C.DIM}({nproc} cores · {load_pct * 100:.0f}% saturated){C.RESET}"
+    )
+    model = cpu_model()
+    if model != "?":
+        # Truncate so we don't blow the line on a long CPU model string
+        if len(model) > width - 4:
+            model = model[: width - 5] + "…"
+        print(f"  {C.DIM}{model}{C.RESET}")
+    print()
+
+    # ── MEMORY ──
+    mi = mem_info_kb()
+    if mi:
+        mem_total_gb = mi.get("MemTotal", 0) / (1024**2)
+        mem_avail_gb = mi.get("MemAvailable", 0) / (1024**2)
+        mem_used_gb = mem_total_gb - mem_avail_gb
+        mem_pct = (mem_used_gb / mem_total_gb * 100) if mem_total_gb else 0
+        if mem_pct < 70:
+            mem_color = C.GREEN
+        elif mem_pct < 90:
+            mem_color = C.YELLOW
+        else:
+            mem_color = C.RED
+        swap_total_gb = mi.get("SwapTotal", 0) / (1024**2)
+        swap_free_gb = mi.get("SwapFree", 0) / (1024**2)
+        swap_used_gb = swap_total_gb - swap_free_gb
+        print(section("MEMORY"))
+        print(
+            f"  RAM   {mem_color}{mem_used_gb:.1f} / {mem_total_gb:.0f} GB"
+            f"  ({mem_pct:.0f}%){C.RESET}"
+        )
+        if swap_total_gb > 0:
+            swap_pct = swap_used_gb / swap_total_gb * 100
+            print(
+                f"  swap  {swap_used_gb:.1f} / {swap_total_gb:.0f} GB  "
+                f"{C.DIM}({swap_pct:.0f}%){C.RESET}"
+            )
+        else:
+            print(f"  swap  {C.DIM}none configured{C.RESET}")
+        print()
+
+    # ── GPU ──
     g = gpu_info()
+    print(section("GPU"))
     if g:
         temp = g["temp"]
         if temp is None:
@@ -224,12 +397,47 @@ def render() -> None:
         else:
             mem = "—"
         print(
-            f"  {temp_color}●{C.RESET} {C.BOLD}GPU:{C.RESET} {g['name']} · "
+            f"  {temp_color}●{C.RESET} {g['name']} · "
             f"{temp_color}{temp_str}{C.RESET} · {util} util · {mem}"
         )
     else:
-        print(f"  {C.RED}●{C.RESET} {C.BOLD}GPU:{C.RESET} nvidia-smi failed")
+        print(f"  {C.RED}●{C.RESET} nvidia-smi failed (driver not loaded?)")
+    print()
 
+    # ── DISK ──
+    # Curated list: root, /home (where the worker repo + outputs live),
+    # /tmp (worker writes scratch outputs there), and a couple of common
+    # data-mount candidates if they exist on this box. We dedupe by
+    # st_dev so paths that share a filesystem render as a single row.
+    print(section("DISK"))
+    interesting_paths = ["/", "/home", "/tmp"]
+    for candidate in ("/data", "/mnt/data"):
+        if os.path.ismount(candidate):
+            interesting_paths.append(candidate)
+    by_dev: dict[int, list[str]] = {}
+    for path in interesting_paths:
+        try:
+            dev = os.stat(path).st_dev
+        except OSError:
+            continue
+        by_dev.setdefault(dev, []).append(path)
+    for paths in by_dev.values():
+        u = disk_usage(paths[0])
+        if not u:
+            continue
+        used_gb, total_gb = u
+        pct = (used_gb / total_gb * 100) if total_gb else 0
+        if pct < 80:
+            color = C.GREEN
+        elif pct < 90:
+            color = C.YELLOW
+        else:
+            color = C.RED
+        label = ", ".join(paths)
+        print(
+            f"  {label:<22} {color}{used_gb:6.1f} / {total_gb:.0f} GB"
+            f"  ({pct:.0f}%){C.RESET}"
+        )
     print()
 
     # Current job, throughput — from dashboard (no local equivalent)
@@ -243,7 +451,7 @@ def render() -> None:
             None,
         )
         cj = target.get("currentJob") if target else None
-        print(f"{C.BOLD}{C.CYAN}NOW{C.RESET}")
+        print(section("NOW"))
         if cj:
             start = cj.get("processingStartedAt")
             elapsed = "—"
@@ -270,7 +478,7 @@ def render() -> None:
             hr = target.get("doneLastHour", 0)
             day = target.get("doneLastDay", 0)
             print(
-                f"{C.BOLD}{C.CYAN}THROUGHPUT{C.RESET}  "
+                f"{section('THROUGHPUT')}  "
                 f"{C.BOLD}{C.GREEN}{hr}{C.RESET}/hr  "
                 f"{C.BOLD}{C.WHITE}{day}{C.RESET}/day"
             )
@@ -280,7 +488,7 @@ def render() -> None:
         print()
 
     # Journal — always local
-    print(f"{C.BOLD}{C.CYAN}WORKER JOURNAL{C.RESET}  {C.DIM}last 8 lines{C.RESET}")
+    print(f"{section('WORKER JOURNAL')}  {C.DIM}last 8 lines{C.RESET}")
     print(rule)
     lines = journalctl_tail("arem-worker-local", 8)
     if lines:
