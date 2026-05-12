@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=AREM Fleet TUI
+Comment=Live worker status display in a full-screen terminal (auto-starts on GNOME login)
+# `watch -t -c` keeps ANSI colors and hides the watch header for full-screen output.
+# `--maximize` is safer than --full-screen — keeps the window manager controls reachable
+# so you can dismiss the window without finding the keyboard shortcut.
+Exec=gnome-terminal --maximize --hide-menubar -- bash -c 'watch -n 2 -t -c python3 /home/jordan/arem-worker/arem-fleet-tui.py'
+Terminal=false
+X-GNOME-Autostart-enabled=true
+# Wait for the GNOME session to settle before launching so we don't race the
+# compositor / network stack on a cold boot.
+X-GNOME-Autostart-Delay=10
+Categories=Utility;
