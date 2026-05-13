@@ -47,10 +47,12 @@ import json
 import os
 import re
 import sys
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections import defaultdict
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 
@@ -62,6 +64,7 @@ from PIL import Image
 # ─── Dropbox client (token refresh + list + content download) ───────────────
 
 _TOK: dict[str, object] = {"access": os.environ.get("DROPBOX_ACCESS_TOKEN")}
+_TOK_LOCK = threading.Lock()  # serialize refresh across worker threads
 
 
 def _refresh_token() -> str:
@@ -72,19 +75,23 @@ def _refresh_token() -> str:
         raise RuntimeError(
             "DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET required"
         )
-    data = urllib.parse.urlencode(
-        {
-            "grant_type": "refresh_token",
-            "refresh_token": refresh,
-            "client_id": key,
-            "client_secret": secret,
-        }
-    ).encode()
-    req = urllib.request.Request("https://api.dropboxapi.com/oauth2/token", data=data)
-    with urllib.request.urlopen(req, timeout=10) as r:
-        j = json.loads(r.read().decode())
-    _TOK["access"] = j["access_token"]
-    return j["access_token"]
+    with _TOK_LOCK:
+        # Re-check inside the lock — another thread may have just refreshed.
+        # Hmm, but we don't track expiry here; OK to occasionally double-refresh
+        # since the upstream call already serializes them in practice.
+        data = urllib.parse.urlencode(
+            {
+                "grant_type": "refresh_token",
+                "refresh_token": refresh,
+                "client_id": key,
+                "client_secret": secret,
+            }
+        ).encode()
+        req = urllib.request.Request("https://api.dropboxapi.com/oauth2/token", data=data)
+        with urllib.request.urlopen(req, timeout=10) as r:
+            j = json.loads(r.read().decode())
+        _TOK["access"] = j["access_token"]
+        return j["access_token"]
 
 
 def _dropbox_headers() -> dict[str, str]:
@@ -268,6 +275,18 @@ def main() -> None:
     ap.add_argument("--since", type=int, default=30, help="Days back")
     ap.add_argument("--csv", type=str, default=None)
     ap.add_argument("--resize", type=int, default=600)
+    ap.add_argument(
+        "--interior-only", action="store_true",
+        help="Filter to ImageReviews with enrichment.roomType != 'exterior' (and not null)",
+    )
+    ap.add_argument(
+        "--target", type=int, default=None,
+        help="Stop iterating jobs once total analyzed pairs >= this number",
+    )
+    ap.add_argument(
+        "--workers", type=int, default=4,
+        help="Concurrent Dropbox downloads per job (default 4)",
+    )
     args = ap.parse_args()
 
     db_url = os.environ.get("DATABASE_URL")
@@ -291,11 +310,40 @@ def main() -> None:
         (since_dt, args.jobs),
     )
     jobs = cur.fetchall()
-    conn.close()
     print(f"# Found {len(jobs)} done jobs in last {args.since} days\n")
+    if args.interior_only:
+        print("# Filter: interior-only (ImageReview.enrichment.roomType != 'exterior')\n")
+    if args.target:
+        print(f"# Target: stop after >= {args.target} pairs analyzed\n")
 
     rows: list[dict] = []
+    room_counts: Counter[str] = Counter()
+
+    def _analyze_pair(o_name: str, v_name: str, o_path: str, v_path: str,
+                      task_label: str, room: str | None) -> dict | None:
+        try:
+            o_bytes = download_file(o_path)
+            v_bytes = download_file(v_path)
+            o_s = image_stats(o_bytes, args.resize)
+            v_s = image_stats(v_bytes, args.resize)
+        except Exception as e:
+            print(f"    skip {o_name}: {str(e)[:120]}")
+            return None
+        return {
+            "job": task_label,
+            "ours_name": o_name,
+            "vendor_name": v_name,
+            "room_type": room or "",
+            **{f"ours_{k}": o_s[k] for k in METRICS},
+            **{f"vendor_{k}": v_s[k] for k in METRICS},
+            **{f"d_{k}": o_s[k] - v_s[k] for k in METRICS},
+        }
+
     for ji, (jid, task, folder, photog, dpath) in enumerate(jobs, 1):
+        if args.target and len(rows) >= args.target:
+            print(f"# Reached target ({len(rows)} >= {args.target}) — stopping.\n")
+            break
+
         print(f"[{ji}/{len(jobs)}] T-{task} · {folder!r}", flush=True)
         try:
             ours_entries = list_folder(f"{dpath}/08-Test-Edit")
@@ -318,30 +366,62 @@ def main() -> None:
         if not pairs:
             print(f"  no pairs (ours={len(ours_paths)}, vendor={len(vendor_paths)})")
             continue
-        # Evenly sample pairs across the shoot (not just the first N).
+
+        # Pull this job's ImageReview enrichment to map midStem -> roomType.
+        room_by_stem: dict[str, str | None] = {}
+        if args.interior_only:
+            cur.execute(
+                """SELECT "midStem", enrichment
+                     FROM "ImageReview"
+                    WHERE "jobId" = %s""",
+                (jid,),
+            )
+            for stem, enrichment in cur.fetchall():
+                if isinstance(enrichment, dict):
+                    room_by_stem[stem] = enrichment.get("roomType")
+                else:
+                    room_by_stem[stem] = None
+
+            before = len(pairs)
+            pairs = [
+                (o, v) for (o, v) in pairs
+                if (rt := room_by_stem.get(_stem(o))) and rt != "exterior"
+            ]
+            print(f"  interior filter: {before} → {len(pairs)} pairs")
+            if not pairs:
+                continue
+
+        # Evenly sample pairs across the (post-filter) shoot.
         if len(pairs) > args.per_job:
             idxs = np.linspace(0, len(pairs) - 1, args.per_job, dtype=int)
             pairs = [pairs[i] for i in idxs]
         print(f"  {len(pairs)} pairs sampled (of {len(ours_paths)} ours / {len(vendor_paths)} vendor)")
 
-        for o_name, v_name in pairs:
-            try:
-                o_bytes = download_file(ours_paths[o_name])
-                v_bytes = download_file(vendor_paths[v_name])
-                o_s = image_stats(o_bytes, args.resize)
-                v_s = image_stats(v_bytes, args.resize)
-            except Exception as e:
-                print(f"    skip {o_name}: {str(e)[:120]}")
-                continue
-            row = {
-                "job": f"T-{task}",
-                "ours_name": o_name,
-                "vendor_name": v_name,
-                **{f"ours_{k}": o_s[k] for k in METRICS},
-                **{f"vendor_{k}": v_s[k] for k in METRICS},
-                **{f"d_{k}": o_s[k] - v_s[k] for k in METRICS},
-            }
-            rows.append(row)
+        # If we have a target, don't overshoot it on this job.
+        if args.target:
+            remaining = args.target - len(rows)
+            if remaining > 0 and len(pairs) > remaining:
+                pairs = pairs[:remaining]
+
+        # Parallel download/analyze for this job (token refresh is lock-protected).
+        task_label = f"T-{task}"
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = [
+                pool.submit(
+                    _analyze_pair,
+                    o, v, ours_paths[o], vendor_paths[v], task_label,
+                    room_by_stem.get(_stem(o)),
+                )
+                for (o, v) in pairs
+            ]
+            for fut in as_completed(futures):
+                row = fut.result()
+                if row:
+                    rows.append(row)
+                    if row["room_type"]:
+                        room_counts[row["room_type"]] += 1
+
+    conn.close()
 
     if not rows:
         sys.exit("\nNo pairs analyzed — nothing to aggregate.")
@@ -351,6 +431,10 @@ def main() -> None:
         f"\n# Analyzed {len(rows)} paired frames across {n_jobs} jobs.\n"
         f"# (Aggregating deltas in sRGB space, ours - vendor.)\n"
     )
+    if room_counts:
+        top = sorted(room_counts.items(), key=lambda kv: -kv[1])
+        breakdown = ", ".join(f"{k}={v}" for k, v in top)
+        print(f"# Room-type breakdown: {breakdown}\n")
 
     # ─── Aggregate table ───────────────────────────────────────────────────
     hdr = f"{'metric':<14}  {'ours_mean':>10}  {'vendor_mean':>10}  {'Δ mean':>9}  {'Δ median':>9}  {'Δ stdev':>9}"
