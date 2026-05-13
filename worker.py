@@ -59,6 +59,12 @@ WORK_ROOT = Path(os.environ.get("WORK_ROOT", "/tmp/arem-worker"))
 DROPBOX_OUTPUT_FOLDER = os.environ.get("DROPBOX_OUTPUT_FOLDER", "08-Test-Edit")
 IDLE_SLEEP = int(os.environ.get("IDLE_SLEEP", "60"))
 HEARTBEAT_SLEEP = int(os.environ.get("HEARTBEAT_SLEEP", "30"))
+# Set UPLOAD_STAGE1=1 to upload each completed job's Stage-1 NAFNet
+# outputs to R2 (training-stage1/<jobId>/<midStem>.jpg) for downstream
+# fine-tuning training-pair assembly. Stage 1 outputs are produced by
+# run_pipeline.py at <pred_root>/stage1/ and otherwise discarded with
+# the scratch dir.
+UPLOAD_STAGE1 = os.environ.get("UPLOAD_STAGE1", "") in ("1", "true", "yes")
 
 PMTX_STATIC = os.environ.get("PMTX_STATIC",
     str(Path.home() / "photomatix/PhotomatixCL/PhotomatixCL-static"))
@@ -506,6 +512,59 @@ def process_job(job: dict) -> dict:
             log(f"  classification: posted {n_cls}/{len(triplets)} records to dashboard")
     except Exception as e:
         log(f"  WARN thumbnail/classification step: {str(e)[:200]}")
+
+    # ── Upload Stage-1 NAFNet outputs to R2 (for fine-tune training pairs) ──
+    # Gated by UPLOAD_STAGE1=1. run_pipeline.py wrote each pre-Stage-2
+    # intermediate at <pred_root>/stage1/<midStem>_stage1.jpg. We strip
+    # the _stage1 suffix on upload so R2 keys match the midStem convention
+    # used by other backfilled artifacts (image-thumbnails/, vendor-mirrors/).
+    # All best-effort: a Stage-1 upload failure must NOT prevent the job
+    # from being reported done.
+    if UPLOAD_STAGE1:
+        try:
+            stage1_dir = pred_root / "stage1"
+            if stage1_dir.is_dir():
+                renamed_dir = pred_root / "stage1_renamed"
+                renamed_dir.mkdir(parents=True, exist_ok=True)
+                n_renamed = 0
+                for p in stage1_dir.iterdir():
+                    if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg"):
+                        stem = p.stem
+                        if stem.endswith("_stage1"):
+                            stem = stem[: -len("_stage1")]
+                        shutil.copyfile(p, renamed_dir / f"{stem}.jpg")
+                        n_renamed += 1
+                if n_renamed > 0:
+                    r2_prefix = f"r2:arem-training-data/training-stage1/{job_id}"
+                    r = rclone(
+                        ["copy", str(renamed_dir), r2_prefix,
+                         "--transfers", "8", "--checkers", "8"],
+                        timeout=900,
+                    )
+                    if r.returncode != 0:
+                        log(f"  WARN stage1 upload rc={r.returncode}: {r.stderr[-200:]}")
+                    else:
+                        log(f"  stage1: uploaded {n_renamed} JPGs to R2")
+                        # POST stage1R2Path per image — same endpoint as the
+                        # classification step, partial-PATCH semantics
+                        # mean only this field gets updated per row.
+                        n_posted = 0
+                        for p in renamed_dir.iterdir():
+                            if not p.is_file():
+                                continue
+                            stem = p.stem
+                            try:
+                                _post("/api/internal/image-classification", {
+                                    "jobId": job_id,
+                                    "midStem": stem,
+                                    "stage1R2Path": f"training-stage1/{job_id}/{stem}.jpg",
+                                })
+                                n_posted += 1
+                            except Exception as e:
+                                log(f"  WARN stage1 POST for {stem}: {str(e)[:200]}")
+                        log(f"  stage1: posted {n_posted}/{n_renamed} paths to dashboard")
+        except Exception as e:
+            log(f"  WARN stage1 upload step: {str(e)[:200]}")
 
     # Cleanup local scratch — keep raws if it failed earlier (won't reach here)
     try:
