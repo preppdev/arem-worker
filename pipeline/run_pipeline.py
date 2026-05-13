@@ -573,6 +573,112 @@ def classify(clf, label_names, tfm, jpg_path, device) -> tuple[bool, float, str]
     return label_names[idx] == "interior", float(prob[idx]), label_names[idx]
 
 
+# ─── Room classifier (TwoHead ResNet-18 — occupancy + 9-class room) ─────────
+# Same architecture as scripts/enrich_scenes.py in the dashboard repo; we
+# re-implement here to keep the worker self-contained (no cross-repo Python
+# imports). Falls back to silently skipping if the checkpoint path isn't set
+# or the file doesn't exist — older worker deployments without the room
+# checkpoint just emit isInteriorWorker without roomTypeWorker.
+
+class _RoomTwoHead(nn.Module):
+    def __init__(self, n_rooms: int, n_occ: int):
+        super().__init__()
+        self.backbone = tvmodels.resnet18(weights=None)
+        feat = self.backbone.fc.in_features
+        self.backbone.fc = nn.Identity()
+        self.occ_head = nn.Linear(feat, n_occ)
+        self.room_head = nn.Linear(feat, n_rooms)
+
+    def forward(self, x):
+        f = self.backbone(x)
+        return self.occ_head(f), self.room_head(f)
+
+
+def load_room_classifier(ckpt_path: Path | None, device):
+    """Return (model, room_types, occupancies, tfm, version) or None."""
+    if not ckpt_path or not Path(ckpt_path).is_file():
+        print(f"  room classifier: skip (no ckpt at {ckpt_path})", flush=True)
+        return None
+    state = torch.load(str(ckpt_path), map_location=device, weights_only=False)
+    room_types = state["room_types"]
+    occupancies = state["occupancies"]
+    model = _RoomTwoHead(n_rooms=len(room_types), n_occ=len(occupancies))
+    model.load_state_dict(state["model_state"])
+    model.to(device).eval()
+    tfm = transforms.Compose([
+        transforms.Resize(256), transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+    version = state.get("version") or "v1"
+    print(
+        f"  Room classifier: {len(room_types)} rooms ({room_types}), "
+        f"{len(occupancies)} occupancies ({occupancies}), ver={version}",
+        flush=True,
+    )
+    return model, room_types, occupancies, tfm, version
+
+
+def classify_room(room_model, jpg_path: Path, device) -> dict | None:
+    """Run the room/occupancy classifier on `jpg_path`. Returns a dict with
+    roomType/confidence/occupancy or None when no model is loaded."""
+    if room_model is None:
+        return None
+    model, room_types, occupancies, tfm, version = room_model
+    im = Image.open(jpg_path).convert("RGB")
+    x = tfm(im).unsqueeze(0).to(device)
+    with torch.no_grad():
+        occ_logits, room_logits = model(x)
+        room_probs = torch.softmax(room_logits, dim=1).cpu().numpy()[0]
+        occ_probs = torch.softmax(occ_logits, dim=1).cpu().numpy()[0]
+    r_idx = int(room_probs.argmax())
+    o_idx = int(occ_probs.argmax())
+    return {
+        "roomType": room_types[r_idx],
+        "roomConfidence": float(room_probs[r_idx]),
+        "occupancy": occupancies[o_idx],
+        "occupancyConfidence": float(occ_probs[o_idx]),
+        "roomDistribution": {n: float(p) for n, p in zip(room_types, room_probs)},
+        "version": version,
+    }
+
+
+# ─── 512px thumbnail + EXIF classification embed ────────────────────────────
+
+def make_thumbnail(src: Path, dst: Path, max_long_edge: int = 512, quality: int = 88):
+    """Save a long-edge-512 thumbnail JPG. Preserves aspect ratio."""
+    im = Image.open(src).convert("RGB")
+    im.thumbnail((max_long_edge, max_long_edge))
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    im.save(dst, "JPEG", quality=quality)
+
+
+def embed_classification_exif(jpg_path: Path, payload: dict) -> bool:
+    """Write classification JSON into EXIF UserComment so external tools
+    (Lightroom, exiftool, anyone reading the JPG bytes) can see the
+    worker's verdict without round-tripping through the dashboard.
+    Returns True on success, False if piexif isn't available.
+
+    The UserComment tag is the standard EXIF freetext slot. We prepend
+    the ASCII charset prefix per the EXIF spec so well-behaved readers
+    parse it correctly."""
+    try:
+        import piexif  # type: ignore
+    except Exception:
+        return False
+    try:
+        existing = piexif.load(str(jpg_path))
+    except Exception:
+        existing = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
+    blob = b"ASCII\x00\x00\x00" + json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    existing.setdefault("Exif", {})[piexif.ExifIFD.UserComment] = blob
+    try:
+        piexif.insert(piexif.dump(existing), str(jpg_path))
+        return True
+    except Exception:
+        return False
+
+
 def stage2_infer(model, jpg_path: Path, out_path: Path, device,
                  tile=1024, overlap=64, quality=92) -> tuple[int, int]:
     img = cv2.imread(str(jpg_path), cv2.IMREAD_COLOR)
@@ -631,6 +737,10 @@ def process_shoot(raw_dir: Path, out_dir: Path,
     s2_int = load_stage2(int_ckpt, device)
     s2_ext = load_stage2(ext_ckpt, device)
     clf, label_names, clf_tfm = load_classifier(clf_ckpt, device)
+    # Optional — gated by env CLASSIFIER_ROOM. If unset/missing the
+    # worker just emits isInteriorWorker without roomTypeWorker.
+    room_ckpt = os.environ.get("CLASSIFIER_ROOM")
+    room_model = load_room_classifier(Path(room_ckpt) if room_ckpt else None, device)
     if torch.cuda.is_available():
         print(f"GPU mem after loading: {torch.cuda.memory_allocated()/1e9:.2f} GB",
               flush=True)
@@ -708,6 +818,43 @@ def process_shoot(raw_dir: Path, out_dir: Path,
         if is_int: n_int += 1
         else: n_ext += 1
 
+        # ── Per-image classification + thumbnail (added 2026-05-12) ─────────
+        # Run the room classifier on the Stage-2 output (interior class only
+        # in practice; the model returns null-ish predictions on outdoor
+        # scenes, but we still record them so the dashboard can decide).
+        room = classify_room(room_model, s2_path, device)
+        t_room = time.time()
+
+        # Build the per-image classification payload that will go into
+        # both EXIF and the dashboard POST (worker.py reads from meta).
+        cls_payload = {
+            "isInterior": bool(is_int),
+            "interiorClassifier": "classifier_v2",
+            "interiorConfidence": round(conf, 4),
+            "roomType": (room or {}).get("roomType"),
+            "roomConfidence": round((room or {}).get("roomConfidence") or 0.0, 4) if room else None,
+            "occupancy": (room or {}).get("occupancy"),
+            "modelVersions": {
+                "stage1": stage1_ckpt.name,
+                "stage2": (int_ckpt if is_int else ext_ckpt).name,
+                "interior_classifier": clf_ckpt.name,
+                "room_classifier": (room or {}).get("version"),
+            },
+            "classifiedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        embed_classification_exif(s2_path, cls_payload)
+
+        # 512px long-edge thumbnail. Lives in a sibling dir so the rclone
+        # job-output upload doesn't grab it; worker.py uploads thumbs to
+        # R2 separately.
+        thumb_dir = out_dir / "_thumbnails"
+        thumb_path = thumb_dir / f"{stem}.jpg"
+        try:
+            make_thumbnail(s2_path, thumb_path)
+        except Exception as e:
+            print(f"  [{ti}/{len(triplets)}] {stem}: thumbnail fail: {e}", flush=True)
+            thumb_path = None  # type: ignore
+
         meta["triplets"].append({
             "stem": stem,
             "under": under.name, "mid": mid.name, "over": over.name,
@@ -716,12 +863,19 @@ def process_shoot(raw_dir: Path, out_dir: Path,
             "stage1_path": str(s1_path.relative_to(out_dir)),
             "stage2_path": str(s2_path.relative_to(out_dir)),
             "stage1_size": list(s1_out.shape[:2]),
+            # Classification snapshot — consumed by worker.py for the
+            # POST to /api/internal/image-classification and as the
+            # source-of-truth for what the model decided on this frame.
+            "classification": cls_payload,
+            "thumbnail_path": (str(thumb_path.relative_to(out_dir))
+                               if thumb_path else None),
             "timing_s": {
                 "demos": round(t_demos - t0, 2),
                 "s1": round(t_s1 - t_demos, 2),
                 "clf": round(t_clf - t_s1, 2),
                 "s2": round(t_s2 - t_clf, 2),
-                "total": round(t_s2 - t0, 2),
+                "room": round(t_room - t_s2, 2),
+                "total": round(t_room - t0, 2),
             },
         })
         print(f"  [{ti}/{len(triplets)}] {stem} {route} ({conf:.2f}) "
