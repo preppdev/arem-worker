@@ -44,9 +44,12 @@ ENV CHECKPOINT_STAGE1=/workspace/checkpoints/stage1_jxl_v1_best_lpips.pth \
     CHECKPOINT_EXTERIOR=/workspace/checkpoints/may26_exterior_w32_b4_4gpu_ep29_inference.pth \
     CHECKPOINT_R2_PREFIX=r2:arem-training-data/checkpoints
 
-# Worker code + handler
+# Worker code + handler. scripts/ included so the same image can run
+# one-shot backfill modes (Stage-1 retroactive coverage, future
+# matched-thumbnail jobs, etc.) without affecting production handler.py.
 COPY worker.py /workspace/worker.py
 COPY handler.py /workspace/handler.py
+COPY scripts/ /workspace/scripts/
 COPY entrypoint.sh /workspace/entrypoint.sh
 RUN chmod +x /workspace/entrypoint.sh
 
