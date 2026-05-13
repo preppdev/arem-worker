@@ -237,8 +237,18 @@ def pair_ours_to_vendor(ours_names: list[str], vendor_names: list[str]) -> list[
 # linearized) because the vendor's outputs are also display-referred
 # sRGB — the comparison is meaningful in the space the reviewer sees.
 
-METRICS = ["luminance", "contrast", "r_mean", "g_mean", "b_mean",
-           "rg_ratio", "bg_ratio", "saturation"]
+METRICS = [
+    "luminance", "contrast",
+    "r_mean", "g_mean", "b_mean",
+    "rg_ratio", "bg_ratio",
+    "saturation",
+    # Highlight-clipping metrics — added to distinguish "feels too bright"
+    # from "average luminance is high". A scene can match mean luminance
+    # while clipping a window or a lamp; reviewers read that as "too
+    # bright" but the mean doesn't see it.
+    "luma_p98", "luma_p99",
+    "pct_above_95", "pct_above_99",
+]
 
 
 def image_stats(jpg_bytes: bytes, resize_px: int) -> dict[str, float]:
@@ -256,6 +266,10 @@ def image_stats(jpg_bytes: bytes, resize_px: int) -> dict[str, float]:
         "b_mean": float(B.mean()),
         "rg_ratio": float(R.mean() / max(G.mean(), 1e-6)),  # WB temp proxy
         "bg_ratio": float(B.mean() / max(G.mean(), 1e-6)),  # WB tint proxy
+        "luma_p98": float(np.percentile(Y, 98)),
+        "luma_p99": float(np.percentile(Y, 99)),
+        "pct_above_95": float((Y > 0.95).mean()),  # fraction of pixels near-clipped
+        "pct_above_99": float((Y > 0.99).mean()),  # fraction fully-clipped
     }
     hsv = np.asarray(img.convert("HSV"), dtype=np.float32) / 255.0
     s["saturation"] = float(hsv[..., 1].mean())
@@ -280,6 +294,10 @@ def main() -> None:
         help="Filter to ImageReviews with enrichment.roomType != 'exterior' (and not null)",
     )
     ap.add_argument(
+        "--exterior-only", action="store_true",
+        help="Filter to ImageReviews with enrichment.roomType == 'exterior'",
+    )
+    ap.add_argument(
         "--target", type=int, default=None,
         help="Stop iterating jobs once total analyzed pairs >= this number",
     )
@@ -288,6 +306,8 @@ def main() -> None:
         help="Concurrent Dropbox downloads per job (default 4)",
     )
     args = ap.parse_args()
+    if args.interior_only and args.exterior_only:
+        sys.exit("Pick one of --interior-only or --exterior-only, not both.")
 
     db_url = os.environ.get("DATABASE_URL")
     if not db_url:
@@ -296,19 +316,47 @@ def main() -> None:
     since_dt = datetime.now(timezone.utc) - timedelta(days=args.since)
     conn = psycopg2.connect(db_url)
     cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT id, "taskNumber", "jobFolderName", photographer, "dropboxPath"
-          FROM "Job"
-         WHERE status = 'done'
-           AND "completedAt" > %s
-           AND "archivedAt" IS NULL
-           AND "parentJobId" IS NULL
-         ORDER BY "completedAt" DESC
-         LIMIT %s
-        """,
-        (since_dt, args.jobs),
-    )
+    # When --interior-only / --exterior-only is set, restrict to jobs that
+    # actually have ENRICHED reviews matching the filter. The post-Stage-2
+    # enrichment pipeline is currently backfill-only (per project-summary
+    # §9), so recent shoots have null enrichment — iterating them is
+    # wasted I/O.
+    if args.interior_only or args.exterior_only:
+        room_op = "!=" if args.interior_only else "="
+        cur.execute(
+            f"""
+            SELECT id, "taskNumber", "jobFolderName", photographer, "dropboxPath"
+              FROM "Job"
+             WHERE status = 'done'
+               AND "completedAt" > %s
+               AND "archivedAt" IS NULL
+               AND "parentJobId" IS NULL
+               AND EXISTS (
+                 SELECT 1 FROM "ImageReview" r
+                  WHERE r."jobId" = "Job".id
+                    AND r.enrichment IS NOT NULL
+                    AND r.enrichment->>'roomType' IS NOT NULL
+                    AND r.enrichment->>'roomType' {room_op} 'exterior'
+               )
+             ORDER BY "completedAt" DESC
+             LIMIT %s
+            """,
+            (since_dt, args.jobs),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT id, "taskNumber", "jobFolderName", photographer, "dropboxPath"
+              FROM "Job"
+             WHERE status = 'done'
+               AND "completedAt" > %s
+               AND "archivedAt" IS NULL
+               AND "parentJobId" IS NULL
+             ORDER BY "completedAt" DESC
+             LIMIT %s
+            """,
+            (since_dt, args.jobs),
+        )
     jobs = cur.fetchall()
     print(f"# Found {len(jobs)} done jobs in last {args.since} days\n")
     if args.interior_only:
@@ -369,7 +417,7 @@ def main() -> None:
 
         # Pull this job's ImageReview enrichment to map midStem -> roomType.
         room_by_stem: dict[str, str | None] = {}
-        if args.interior_only:
+        if args.interior_only or args.exterior_only:
             cur.execute(
                 """SELECT "midStem", enrichment
                      FROM "ImageReview"
@@ -383,11 +431,19 @@ def main() -> None:
                     room_by_stem[stem] = None
 
             before = len(pairs)
-            pairs = [
-                (o, v) for (o, v) in pairs
-                if (rt := room_by_stem.get(_stem(o))) and rt != "exterior"
-            ]
-            print(f"  interior filter: {before} → {len(pairs)} pairs")
+            if args.interior_only:
+                pairs = [
+                    (o, v) for (o, v) in pairs
+                    if (rt := room_by_stem.get(_stem(o))) and rt != "exterior"
+                ]
+                tag = "interior"
+            else:
+                pairs = [
+                    (o, v) for (o, v) in pairs
+                    if room_by_stem.get(_stem(o)) == "exterior"
+                ]
+                tag = "exterior"
+            print(f"  {tag} filter: {before} → {len(pairs)} pairs")
             if not pairs:
                 continue
 
@@ -483,6 +539,37 @@ def main() -> None:
         ratio = std_d / max(abs(mean_d), 1e-6)
         verdict = "constant fix viable" if ratio < 1.5 else "needs per-image model"
         print(f"  {m:<14}  ratio={ratio:>6.2f}   ({verdict})")
+
+    # ─── Per-room breakdown ─────────────────────────────────────────────────
+    # Show how the bias varies by room type. Bedrooms vs bathrooms vs
+    # kitchens often have very different lighting profiles, so the average
+    # bias can mask scene-specific patterns. Only show rooms with enough
+    # samples to be statistically meaningful.
+    if room_counts:
+        ROOM_MIN_N = 20
+        room_rows = defaultdict(list)
+        for r in rows:
+            if r["room_type"]:
+                room_rows[r["room_type"]].append(r)
+        eligible = [(rt, rrs) for rt, rrs in room_rows.items() if len(rrs) >= ROOM_MIN_N]
+        if eligible:
+            print(
+                f"\n# Per-room Δ means (n ≥ {ROOM_MIN_N}; only metrics with "
+                f"clear cross-room divergence shown):"
+            )
+            # Focus on the metrics that vary most across rooms — too many
+            # columns and the table becomes unreadable.
+            show = ["luminance", "contrast", "luma_p98", "pct_above_95",
+                    "rg_ratio", "bg_ratio", "saturation"]
+            hdr = f"  {'room':<24} {'n':>4}  " + "  ".join(f"{m:>11}" for m in show)
+            print(hdr)
+            print("  " + "-" * (len(hdr) - 2))
+            for rt, rrs in sorted(eligible, key=lambda x: -len(x[1])):
+                cells = []
+                for m in show:
+                    deltas = np.array([r[f"d_{m}"] for r in rrs])
+                    cells.append(f"{deltas.mean():>+11.4f}")
+                print(f"  {rt:<24} {len(rrs):>4}  " + "  ".join(cells))
 
     if args.csv:
         with open(args.csv, "w", newline="") as f:
