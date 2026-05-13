@@ -1,6 +1,13 @@
 #!/bin/bash
 # Container entrypoint: configure rclone, fetch checkpoints (one-shot per
-# worker), then start the RunPod serverless handler.
+# worker), then dispatch on MODE.
+#
+# MODE values:
+#   unset / "handler"      → production RunPod serverless handler (default)
+#   "backfill_stage1"      → run scripts/backfill_stage1.py with OFFSET +
+#                            LIMIT + optional SINCE/FORCE env. One-shot
+#                            pod: processes its slice of candidate Jobs
+#                            and exits.
 
 set -euo pipefail
 
@@ -47,4 +54,21 @@ fetch "r2:arem-training-data/models/stage2/may26_exterior_w32_b4_4gpu_ep29_infer
       "/workspace/checkpoints/may26_exterior_w32_b4_4gpu_ep29_inference.pth"
 echo "[entrypoint] checkpoints ready"
 
-exec python -u /workspace/handler.py
+case "${MODE:-handler}" in
+  handler)
+    echo "[entrypoint] starting RunPod serverless handler"
+    exec python -u /workspace/handler.py
+    ;;
+  backfill_stage1)
+    echo "[entrypoint] backfill_stage1 mode  OFFSET=${OFFSET:-0}  LIMIT=${LIMIT:-50}  SINCE=${SINCE:-default}"
+    cd /workspace
+    ARGS=(--offset "${OFFSET:-0}" --limit "${LIMIT:-50}")
+    if [ -n "${SINCE:-}" ]; then ARGS+=(--since "$SINCE"); fi
+    if [ -n "${FORCE:-}" ] && [ "${FORCE}" != "0" ]; then ARGS+=(--force); fi
+    exec python -u -m scripts.backfill_stage1 "${ARGS[@]}"
+    ;;
+  *)
+    echo "[entrypoint] ERROR: unknown MODE: $MODE"
+    exit 2
+    ;;
+esac
