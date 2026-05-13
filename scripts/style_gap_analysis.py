@@ -295,7 +295,11 @@ def main() -> None:
     )
     ap.add_argument(
         "--exterior-only", action="store_true",
-        help="Filter to ImageReviews with enrichment.roomType == 'exterior'",
+        help=(
+            "Filter to ImageReviews with non-null enrichment but roomType IS NULL. "
+            "The room classifier is interior-only (9 classes; bedroom/bathroom/kitchen/...), "
+            "so exteriors fall out as null-roomType after enrichment."
+        ),
     )
     ap.add_argument(
         "--target", type=int, default=None,
@@ -322,7 +326,16 @@ def main() -> None:
     # §9), so recent shoots have null enrichment — iterating them is
     # wasted I/O.
     if args.interior_only or args.exterior_only:
-        room_op = "!=" if args.interior_only else "="
+        if args.interior_only:
+            room_clause = (
+                "r.enrichment->>'roomType' IS NOT NULL "
+                "AND r.enrichment->>'roomType' != 'exterior'"
+            )
+        else:
+            # Enriched but null roomType = "the 9-class interior classifier
+            # didn't fire", which empirically maps to outdoor / exterior /
+            # not-a-room scenes.
+            room_clause = "r.enrichment->>'roomType' IS NULL"
         cur.execute(
             f"""
             SELECT id, "taskNumber", "jobFolderName", photographer, "dropboxPath"
@@ -335,8 +348,7 @@ def main() -> None:
                  SELECT 1 FROM "ImageReview" r
                   WHERE r."jobId" = "Job".id
                     AND r.enrichment IS NOT NULL
-                    AND r.enrichment->>'roomType' IS NOT NULL
-                    AND r.enrichment->>'roomType' {room_op} 'exterior'
+                    AND {room_clause}
                )
              ORDER BY "completedAt" DESC
              LIMIT %s
@@ -432,17 +444,21 @@ def main() -> None:
 
             before = len(pairs)
             if args.interior_only:
+                # Keep only pairs whose ours-side ImageReview row has a
+                # populated non-exterior roomType.
                 pairs = [
                     (o, v) for (o, v) in pairs
                     if (rt := room_by_stem.get(_stem(o))) and rt != "exterior"
                 ]
                 tag = "interior"
             else:
+                # Exterior proxy: enrichment ran (the midStem is a key in
+                # room_by_stem) AND the room classifier returned null.
                 pairs = [
                     (o, v) for (o, v) in pairs
-                    if room_by_stem.get(_stem(o)) == "exterior"
+                    if _stem(o) in room_by_stem and room_by_stem[_stem(o)] is None
                 ]
-                tag = "exterior"
+                tag = "exterior (null-roomType proxy)"
             print(f"  {tag} filter: {before} → {len(pairs)} pairs")
             if not pairs:
                 continue
