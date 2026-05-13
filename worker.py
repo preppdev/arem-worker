@@ -464,6 +464,49 @@ def process_job(job: dict) -> dict:
     log(f"  done. {n_jpg} JPGs in {runtime_sec}s; {len(grouping_warnings)} grouping warnings"
         + (f"; peak_vram={peak_vram_gb} GB / {gpu_total_gb} GB" if peak_vram_gb else ""))
 
+    # ── Upload 512px thumbnails to R2 + report per-image classification ─────
+    # run_pipeline.py wrote per-image classification into _meta.json and
+    # 512px thumbnails into <pred_root>/_thumbnails/. Push thumbs to
+    # r2:arem-training-data/image-thumbnails/<jobId>/<stem>.jpg, then
+    # POST one classification record per image to the dashboard.
+    # All best-effort — a thumbnail/classification failure must NOT
+    # prevent the job from being reported done.
+    try:
+        thumbs_dir = pred_root / "_thumbnails"
+        triplets = (meta or {}).get("triplets", []) if "meta" in locals() else []
+        if thumbs_dir.is_dir() and triplets:
+            r2_prefix = f"r2:arem-training-data/image-thumbnails/{job_id}"
+            r2_upload = rclone(
+                ["copy", str(thumbs_dir), r2_prefix,
+                 "--transfers", "8", "--checkers", "8"],
+                timeout=600,
+            )
+            if r2_upload.returncode != 0:
+                log(f"  WARN thumbnail upload rc={r2_upload.returncode}: {r2_upload.stderr[-200:]}")
+            n_cls = 0
+            for t in triplets:
+                stem = t.get("stem")
+                cls = t.get("classification")
+                if not stem or not cls:
+                    continue
+                thumb_key = f"image-thumbnails/{job_id}/{stem}.jpg"
+                try:
+                    _post("/api/internal/image-classification", {
+                        "jobId": job_id,
+                        "midStem": stem,
+                        "isInteriorWorker": cls.get("isInterior"),
+                        "roomTypeWorker": cls.get("roomType"),
+                        "roomConfidenceWorker": cls.get("roomConfidence"),
+                        "classifierModelVersions": cls.get("modelVersions"),
+                        "thumbnailR2Path": thumb_key if (thumbs_dir / f"{stem}.jpg").is_file() else None,
+                    })
+                    n_cls += 1
+                except Exception as e:
+                    log(f"  WARN classification POST for {stem}: {str(e)[:200]}")
+            log(f"  classification: posted {n_cls}/{len(triplets)} records to dashboard")
+    except Exception as e:
+        log(f"  WARN thumbnail/classification step: {str(e)[:200]}")
+
     # Cleanup local scratch — keep raws if it failed earlier (won't reach here)
     try:
         shutil.rmtree(work)
