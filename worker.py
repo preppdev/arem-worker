@@ -66,6 +66,13 @@ HEARTBEAT_SLEEP = int(os.environ.get("HEARTBEAT_SLEEP", "30"))
 # the scratch dir.
 UPLOAD_STAGE1 = os.environ.get("UPLOAD_STAGE1", "") in ("1", "true", "yes")
 
+# Production-output bucket. After every Dropbox upload succeeds, the
+# worker also pushes each final JPG to
+# r2:<R2_OUTPUT_BUCKET>/jobs/<jobId>/<filename>.jpg and POSTs the key
+# back so the dashboard can hand the URL to the virtual-tour platform +
+# media-delivery surfaces. Empty value disables the dual-write entirely.
+R2_OUTPUT_BUCKET = os.environ.get("R2_OUTPUT_BUCKET", "")
+
 PMTX_STATIC = os.environ.get("PMTX_STATIC",
     str(Path.home() / "photomatix/PhotomatixCL/PhotomatixCL-static"))
 AREM_REPO = Path(os.environ.get("AREM_REPO",
@@ -371,6 +378,42 @@ def upload_outputs(local_dir: Path, dropbox_job_path: str) -> int:
     return len(list(local_dir.glob("*.jpg")))
 
 
+def upload_outputs_production_r2(local_dir: Path, job_id: str) -> list[tuple[str, str]]:
+    """Dual-write the final JPGs to the production output bucket.
+
+    Key shape: jobs/<jobId>/<filename>.jpg. Returns a list of
+    (midStem, productionR2Path) for every JPG that landed, where
+    midStem strips any '_stage2-{int|ext}' suffix so the dashboard can
+    join cleanly against ImageReview.midStem.
+
+    Best-effort. A non-zero rclone rc raises so the caller can log it
+    but the production output bucket is not on the critical path for
+    delivery (Dropbox upload already succeeded); upstream code can swallow
+    that exception without failing the job.
+    """
+    if not R2_OUTPUT_BUCKET:
+        return []
+    dst = f"r2:{R2_OUTPUT_BUCKET}/jobs/{job_id}"
+    r = rclone(["copy", str(local_dir), dst,
+                "--include", "*.jpg",
+                "--transfers", "8", "--progress=false"])
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"r2 production upload failed rc={r.returncode}: {r.stderr[-300:]}")
+    pairs: list[tuple[str, str]] = []
+    for p in sorted(local_dir.glob("*.jpg")):
+        # run_pipeline.py emits '<stem>_stage2-{int|ext}.jpg'. midStem in
+        # ImageReview is just the bare stem, so strip the suffix when
+        # building the per-image POST.
+        stem = p.stem
+        for suffix in ("_stage2-int", "_stage2-ext"):
+            if stem.endswith(suffix):
+                stem = stem[: -len(suffix)]
+                break
+        pairs.append((stem, f"jobs/{job_id}/{p.name}"))
+    return pairs
+
+
 def download_manual_inputs(inputs: list[dict], local_raw_dir: Path) -> tuple[int, int]:
     """Manual-upload ingest: fetch each presigned R2 URL into local_raw_dir.
 
@@ -444,10 +487,25 @@ def process_job(job: dict) -> dict:
         output_prefix = manual.get("outputPrefix") or f"manual_uploads/{job_id}/outputs/"
         log(f"  [4/4] uploading outputs to R2 ({output_prefix})")
         n_jpg, output_keys = upload_manual_outputs(upright_dir, output_prefix)
+        production_pairs: list[tuple[str, str]] = []
     else:
         log(f"  [4/4] uploading to {DROPBOX_OUTPUT_FOLDER}")
         n_jpg = upload_outputs(upright_dir, dropbox_path)
         output_keys = None
+
+        # Dual-write the same JPGs to the production output bucket.
+        # Best-effort: an R2 failure is logged and reported as a warning
+        # in the meta but does NOT roll back the Dropbox upload or fail
+        # the job. The per-image POST happens later in the thumbnail
+        # block so we can reuse the same productionR2Path list.
+        production_pairs = []
+        if R2_OUTPUT_BUCKET:
+            try:
+                production_pairs = upload_outputs_production_r2(upright_dir, job_id)
+                log(f"    production R2 dual-write: {len(production_pairs)} files → "
+                    f"r2:{R2_OUTPUT_BUCKET}/jobs/{job_id}/")
+            except Exception as e:
+                log(f"  WARN production R2 dual-write: {str(e)[:200]}")
 
     # Read _meta.json from the inference step to surface grouping failures
     # and peak VRAM. Each anchor that couldn't be paired is a data-hygiene
@@ -489,6 +547,9 @@ def process_job(job: dict) -> dict:
             )
             if r2_upload.returncode != 0:
                 log(f"  WARN thumbnail upload rc={r2_upload.returncode}: {r2_upload.stderr[-200:]}")
+            # Map midStem -> productionR2Path so each per-image POST can
+            # also carry the dual-written R2 key.
+            production_by_stem = {stem: key for stem, key in production_pairs}
             n_cls = 0
             for t in triplets:
                 stem = t.get("stem")
@@ -505,6 +566,7 @@ def process_job(job: dict) -> dict:
                         "roomConfidenceWorker": cls.get("roomConfidence"),
                         "classifierModelVersions": cls.get("modelVersions"),
                         "thumbnailR2Path": thumb_key if (thumbs_dir / f"{stem}.jpg").is_file() else None,
+                        "productionR2Path": production_by_stem.get(stem),
                     })
                     n_cls += 1
                 except Exception as e:
