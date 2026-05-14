@@ -19,7 +19,6 @@ Env:
     R2_OUTPUT_BUCKET      default arem-production-edit-jobs
     RCLONE_DROPBOX        default 'dropbox'
     RCLONE_R2             default 'r2'
-    DROPBOX_OUTPUT_FOLDER default '08-Test-Edit' (matches worker.py)
 """
 from __future__ import annotations
 
@@ -39,7 +38,6 @@ WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
 R2_OUTPUT_BUCKET = os.environ.get("R2_OUTPUT_BUCKET", "arem-production-edit-jobs")
 RCLONE_DROPBOX = os.environ.get("RCLONE_DROPBOX", "dropbox")
 RCLONE_R2 = os.environ.get("RCLONE_R2", "r2")
-DROPBOX_OUTPUT_FOLDER = os.environ.get("DROPBOX_OUTPUT_FOLDER", "08-Test-Edit")
 
 
 def log(msg: str) -> None:
@@ -111,7 +109,9 @@ def process_job(job: dict, *, dry_run: bool) -> dict:
         log(f"  [{job_id}] non-dropbox output ({out.get('kind')}) — skip")
         return {"jobId": job_id, "skipped": "non-dropbox"}
 
-    dropbox_src = resolve_dropbox(out["path"]) + f"/{DROPBOX_OUTPUT_FOLDER}"
+    # outputLocation.path from the dashboard already includes the
+    # 08-Test-Edit suffix — don't append it again.
+    dropbox_src = resolve_dropbox(out["path"])
     r2_dst = f"{RCLONE_R2}:{R2_OUTPUT_BUCKET}/jobs/{job_id}"
 
     # List the Dropbox source first — empty source = nothing to do.
