@@ -8,8 +8,31 @@
 #                            LIMIT + optional SINCE/FORCE env. One-shot
 #                            pod: processes its slice of candidate Jobs
 #                            and exits.
+#
+# Logging: all stdout+stderr is tee'd to /tmp/entrypoint.log, and on EXIT
+# the log is uploaded to r2:arem-training-data/debug-logs/<hostname>-<ts>.log
+# so failed runs are diagnosable post-hoc (no SSH needed). The upload is
+# best-effort; if rclone isn't configured yet (early entrypoint failure)
+# the log just sits on the dying container.
 
 set -euo pipefail
+
+LOG_FILE=/tmp/entrypoint.log
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+upload_log() {
+  local rc=$?
+  echo "[entrypoint] exit rc=$rc — uploading log to R2"
+  if command -v rclone >/dev/null && [ -f /root/.config/rclone/rclone.conf ]; then
+    local ts; ts=$(date -u +%Y%m%dT%H%M%SZ)
+    local host; host=$(hostname 2>/dev/null || echo "unknown")
+    rclone copyto "$LOG_FILE" \
+      "r2:arem-training-data/debug-logs/${host}-${ts}-rc${rc}.log" \
+      --retries 1 --timeout 30s 2>/dev/null || true
+  fi
+  return $rc
+}
+trap upload_log EXIT
 
 # ---- rclone config from env (R2 + Dropbox) ----
 mkdir -p /root/.config/rclone
