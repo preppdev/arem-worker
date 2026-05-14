@@ -61,6 +61,24 @@ token = ${DROPBOX_TOKEN_JSON}
 EOF
 chmod 600 /root/.config/rclone/rclone.conf
 
+# Immediately drop an "alive" marker into R2 before the heavy checkpoint
+# downloads. Tells us: did we successfully configure rclone? Without this
+# marker, an early failure (OOM during a 12GB checkpoint download,
+# disk-full kill) gives us no visibility because the EXIT trap can be
+# pre-empted by SIGKILL.
+host=$(hostname 2>/dev/null || echo unknown)
+ts_start=$(date -u +%Y%m%dT%H%M%SZ)
+printf '[%s] entrypoint starting on %s\nMODE=%s OFFSET=%s LIMIT=%s SINCE=%s\nMEM:\n%s\nDISK:\n%s\n' \
+  "$ts_start" "$host" "${MODE:-}" "${OFFSET:-}" "${LIMIT:-}" "${SINCE:-}" \
+  "$(free -h 2>&1 || echo n/a)" \
+  "$(df -h 2>&1 || echo n/a)" \
+  > /tmp/startup.log
+rclone copyto /tmp/startup.log \
+  "r2:arem-training-data/debug-logs/${host}-${ts_start}-startup.log" \
+  --retries 1 --timeout 30s 2>/dev/null || \
+  echo "[entrypoint] WARN: failed to upload startup marker"
+echo "[entrypoint] startup marker uploaded"
+
 # ---- Checkpoints (one-time download per cold-started worker) ----
 mkdir -p /workspace/checkpoints
 fetch() {
