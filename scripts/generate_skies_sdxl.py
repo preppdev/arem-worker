@@ -141,7 +141,7 @@ def _post(payload: dict) -> dict:
     import urllib.request
     import urllib.error
     req = urllib.request.Request(
-        f"{DASHBOARD_URL}/api/sky-library",
+        f"{DASHBOARD_URL}/api/internal/sky-library",
         data=json.dumps(payload).encode("utf-8"),
         method="POST",
         headers={
