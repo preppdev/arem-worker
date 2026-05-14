@@ -49,6 +49,8 @@ import urllib.request
 import urllib.error
 import urllib.parse
 
+import requests  # type: ignore  # for Cloudflare Images multipart upload
+
 # ---- config ----
 DASHBOARD_URL = os.environ.get("DASHBOARD_URL",
     "https://arem-editing-dashboard.vercel.app").rstrip("/")
@@ -68,10 +70,21 @@ UPLOAD_STAGE1 = os.environ.get("UPLOAD_STAGE1", "") in ("1", "true", "yes")
 
 # Production-output bucket. After every Dropbox upload succeeds, the
 # worker also pushes each final JPG to
-# r2:<R2_OUTPUT_BUCKET>/jobs/<jobId>/<filename>.jpg and POSTs the key
-# back so the dashboard can hand the URL to the virtual-tour platform +
-# media-delivery surfaces. Empty value disables the dual-write entirely.
+#   r2:<R2_OUTPUT_BUCKET>/tours/<jobId>/photos/<NNNN>-<midStem>.jpg
+# and POSTs (sortOrder, productionR2Path, cfImageId) per-image back to
+# the dashboard so the virtual-tour platform + media-delivery surfaces
+# can read from R2 (archive) + Cloudflare Images (delivery CDN).
+# Empty R2_OUTPUT_BUCKET disables the entire dual-write pathway.
 R2_OUTPUT_BUCKET = os.environ.get("R2_OUTPUT_BUCKET", "")
+
+# Cloudflare Images upload — secondary delivery surface. Each upload
+# returns a cfImageId; downstream consumers render via
+#   https://imagedelivery.net/<account_hash>/<cfImageId>/<variant>
+# (variants already provisioned: w384/w640/w828/w1080/w1200/w1920/w2400).
+# Empty CLOUDFLARE_API_TOKEN disables only the CF Images upload (R2
+# dual-write still runs).
+CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
 
 PMTX_STATIC = os.environ.get("PMTX_STATIC",
     str(Path.home() / "photomatix/PhotomatixCL/PhotomatixCL-static"))
@@ -378,40 +391,103 @@ def upload_outputs(local_dir: Path, dropbox_job_path: str) -> int:
     return len(list(local_dir.glob("*.jpg")))
 
 
-def upload_outputs_production_r2(local_dir: Path, job_id: str) -> list[tuple[str, str]]:
-    """Dual-write the final JPGs to the production output bucket.
+def _strip_stage2_suffix(stem: str) -> str:
+    """Strip the _stage2-int / _stage2-ext suffix from a worker-emitted
+    JPG basename to recover the bare midStem that ImageReview joins on."""
+    for suffix in ("_stage2-int", "_stage2-ext"):
+        if stem.endswith(suffix):
+            return stem[: -len(suffix)]
+    return stem
 
-    Key shape: jobs/<jobId>/<filename>.jpg. Returns a list of
-    (midStem, productionR2Path) for every JPG that landed, where
-    midStem strips any '_stage2-{int|ext}' suffix so the dashboard can
-    join cleanly against ImageReview.midStem.
 
-    Best-effort. A non-zero rclone rc raises so the caller can log it
-    but the production output bucket is not on the critical path for
-    delivery (Dropbox upload already succeeded); upstream code can swallow
-    that exception without failing the job.
+def _cf_images_upload(local_path: Path, *, job_id: str, mid_stem: str,
+                      sort_order: int) -> str | None:
+    """Upload one JPG to Cloudflare Images. Returns the cfImageId on
+    success, None on failure. Failures are logged but never raise — CF
+    Images is the delivery copy, not the durable one (R2 already
+    succeeded by the time we get here)."""
+    if not CLOUDFLARE_API_TOKEN or not CLOUDFLARE_ACCOUNT_ID:
+        return None
+    url = (f"https://api.cloudflare.com/client/v4/accounts/"
+           f"{CLOUDFLARE_ACCOUNT_ID}/images/v1")
+    meta = json.dumps({
+        "src": "arem-worker",
+        "jobId": job_id,
+        "midStem": mid_stem,
+        "sortOrder": sort_order,
+    })
+    try:
+        with open(local_path, "rb") as f:
+            files = {
+                "file": (local_path.name, f, "image/jpeg"),
+                "metadata": (None, meta, "application/json"),
+            }
+            resp = requests.post(
+                url,
+                headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"},
+                files=files,
+                timeout=60,
+            )
+    except Exception as e:
+        log(f"  WARN CF Images upload {mid_stem}: {str(e)[:200]}")
+        return None
+    if resp.status_code != 200:
+        log(f"  WARN CF Images upload {mid_stem}: HTTP {resp.status_code} "
+            f"{resp.text[:200]}")
+        return None
+    try:
+        return resp.json()["result"]["id"]
+    except Exception as e:
+        log(f"  WARN CF Images parse {mid_stem}: {str(e)[:200]}")
+        return None
+
+
+def upload_outputs_production_r2(local_dir: Path, job_id: str) -> list[dict]:
+    """Push the final JPGs to the production output bucket + Cloudflare
+    Images and return one record per uploaded image.
+
+    R2 key shape (new spec):
+      tours/<jobId>/photos/<sortOrder:04d>-<midStem>.jpg
+
+    sortOrder is a 1-based ordinal computed from alphabetical midStem
+    order within the job. The bucket is configured at R2-IA storage class.
+
+    Returns: list of {midStem, sortOrder, productionR2Path, cfImageId}.
+    Best-effort: an exception in this function is reported up so the
+    caller can log+swallow; the job itself stays "done" since Dropbox
+    already delivered.
     """
     if not R2_OUTPUT_BUCKET:
         return []
-    dst = f"r2:{R2_OUTPUT_BUCKET}/jobs/{job_id}"
-    r = rclone(["copy", str(local_dir), dst,
-                "--include", "*.jpg",
-                "--transfers", "8", "--progress=false"])
-    if r.returncode != 0:
-        raise RuntimeError(
-            f"r2 production upload failed rc={r.returncode}: {r.stderr[-300:]}")
-    pairs: list[tuple[str, str]] = []
-    for p in sorted(local_dir.glob("*.jpg")):
-        # run_pipeline.py emits '<stem>_stage2-{int|ext}.jpg'. midStem in
-        # ImageReview is just the bare stem, so strip the suffix when
-        # building the per-image POST.
-        stem = p.stem
-        for suffix in ("_stage2-int", "_stage2-ext"):
-            if stem.endswith(suffix):
-                stem = stem[: -len(suffix)]
-                break
-        pairs.append((stem, f"jobs/{job_id}/{p.name}"))
-    return pairs
+    # Build the (midStem, source_path, target_filename) list in sortOrder.
+    # The worker emits '<stem>_stage2-{int|ext}.jpg' but we drop the suffix
+    # in the delivered filename — the CC ingest contract expects the
+    # original frame name.
+    jpgs = sorted(local_dir.glob("*.jpg"), key=lambda p: _strip_stage2_suffix(p.stem))
+    if not jpgs:
+        return []
+
+    records: list[dict] = []
+    for idx, p in enumerate(jpgs, start=1):
+        mid_stem = _strip_stage2_suffix(p.stem)
+        target_name = f"{idx:04d}-{mid_stem}.jpg"
+        r2_key = f"tours/{job_id}/photos/{target_name}"
+        r2_url = f"r2:{R2_OUTPUT_BUCKET}/{r2_key}"
+        cp = rclone(["copyto", str(p), r2_url,
+                     "--progress=false"], timeout=180)
+        if cp.returncode != 0:
+            log(f"  WARN r2 production copy {mid_stem}: rc={cp.returncode} "
+                f"{cp.stderr[-200:].strip()}")
+            continue
+        cf_id = _cf_images_upload(p, job_id=job_id, mid_stem=mid_stem,
+                                  sort_order=idx)
+        records.append({
+            "midStem": mid_stem,
+            "sortOrder": idx,
+            "productionR2Path": r2_key,
+            "cfImageId": cf_id,
+        })
+    return records
 
 
 def download_manual_inputs(inputs: list[dict], local_raw_dir: Path) -> tuple[int, int]:
@@ -487,25 +563,27 @@ def process_job(job: dict) -> dict:
         output_prefix = manual.get("outputPrefix") or f"manual_uploads/{job_id}/outputs/"
         log(f"  [4/4] uploading outputs to R2 ({output_prefix})")
         n_jpg, output_keys = upload_manual_outputs(upright_dir, output_prefix)
-        production_pairs: list[tuple[str, str]] = []
+        production_records: list[dict] = []
     else:
         log(f"  [4/4] uploading to {DROPBOX_OUTPUT_FOLDER}")
         n_jpg = upload_outputs(upright_dir, dropbox_path)
         output_keys = None
 
-        # Dual-write the same JPGs to the production output bucket.
-        # Best-effort: an R2 failure is logged and reported as a warning
-        # in the meta but does NOT roll back the Dropbox upload or fail
-        # the job. The per-image POST happens later in the thumbnail
-        # block so we can reuse the same productionR2Path list.
-        production_pairs = []
+        # Dual-write the same JPGs to the production output bucket +
+        # Cloudflare Images. Best-effort: an exception here is logged
+        # as a warning but does NOT roll back the Dropbox upload or
+        # fail the job. The per-image POST happens later in the
+        # thumbnail block so we reuse the same records list.
+        production_records = []
         if R2_OUTPUT_BUCKET:
             try:
-                production_pairs = upload_outputs_production_r2(upright_dir, job_id)
-                log(f"    production R2 dual-write: {len(production_pairs)} files → "
-                    f"r2:{R2_OUTPUT_BUCKET}/jobs/{job_id}/")
+                production_records = upload_outputs_production_r2(upright_dir, job_id)
+                n_cf = sum(1 for r in production_records if r.get("cfImageId"))
+                log(f"    production dual-write: {len(production_records)} files → "
+                    f"r2:{R2_OUTPUT_BUCKET}/tours/{job_id}/photos/  "
+                    f"cf_images={n_cf}/{len(production_records)}")
             except Exception as e:
-                log(f"  WARN production R2 dual-write: {str(e)[:200]}")
+                log(f"  WARN production dual-write: {str(e)[:200]}")
 
     # Read _meta.json from the inference step to surface grouping failures
     # and peak VRAM. Each anchor that couldn't be paired is a data-hygiene
@@ -547,9 +625,10 @@ def process_job(job: dict) -> dict:
             )
             if r2_upload.returncode != 0:
                 log(f"  WARN thumbnail upload rc={r2_upload.returncode}: {r2_upload.stderr[-200:]}")
-            # Map midStem -> productionR2Path so each per-image POST can
-            # also carry the dual-written R2 key.
-            production_by_stem = {stem: key for stem, key in production_pairs}
+            # Map midStem -> production record so each per-image POST
+            # can also carry the dual-write outputs (productionR2Path,
+            # sortOrder, cfImageId).
+            production_by_stem = {r["midStem"]: r for r in production_records}
             n_cls = 0
             for t in triplets:
                 stem = t.get("stem")
@@ -557,6 +636,7 @@ def process_job(job: dict) -> dict:
                 if not stem or not cls:
                     continue
                 thumb_key = f"image-thumbnails/{job_id}/{stem}.jpg"
+                prod = production_by_stem.get(stem) or {}
                 try:
                     _post("/api/internal/image-classification", {
                         "jobId": job_id,
@@ -566,7 +646,9 @@ def process_job(job: dict) -> dict:
                         "roomConfidenceWorker": cls.get("roomConfidence"),
                         "classifierModelVersions": cls.get("modelVersions"),
                         "thumbnailR2Path": thumb_key if (thumbs_dir / f"{stem}.jpg").is_file() else None,
-                        "productionR2Path": production_by_stem.get(stem),
+                        "productionR2Path": prod.get("productionR2Path"),
+                        "sortOrder": prod.get("sortOrder"),
+                        "cfImageId": prod.get("cfImageId"),
                     })
                     n_cls += 1
                 except Exception as e:
