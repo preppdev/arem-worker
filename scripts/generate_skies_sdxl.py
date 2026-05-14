@@ -204,8 +204,14 @@ def load_pipeline(dtype: str = "fp16"):
         variant="fp16" if dtype == "fp16" else None,
     )
     pipe = pipe.to("cuda")
-    # Memory-efficient attention. Saves a few GB; small speed cost.
-    pipe.enable_xformers_memory_efficient_attention()  # type: ignore[attr-defined]
+    # Memory-efficient attention. Saves a few GB; small speed cost. Optional —
+    # falls back to default attention if xformers isn't installed (which it
+    # isn't in the arem-photo-ai conda env by default).
+    try:
+        pipe.enable_xformers_memory_efficient_attention()  # type: ignore[attr-defined]
+        log("  xformers attention enabled")
+    except (ModuleNotFoundError, AttributeError, ImportError) as e:
+        log(f"  xformers unavailable ({type(e).__name__}); using default attention")
     log("  ready")
     return pipe
 
