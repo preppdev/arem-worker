@@ -270,16 +270,28 @@ def process_job(job: dict, *, dry_run: bool) -> dict:
                 })
             os.remove(local)
 
-    # POST the batch to CC. Best-effort: log only.
+    # POST the batch to CC. CC's Shoot ↔ our Job.id are separate id
+    # spaces — always POST to /new with an ensureJob block; CC dedups
+    # via dropboxPath, then address+state+date, else creates a stub.
     cc_accepted = cc_skipped = cc_errors = 0
     if cc_assets:
-        result = cc_ingest.post_media(job_id=job_id, assets=cc_assets)
+        ensure_job = cc_ingest.build_ensure_job(
+            dropbox_path=job.get("dropboxPath"),
+            photographer=job.get("photographer"),
+            completed_at=job.get("completedAt"),
+        )
+        result = cc_ingest.post_media(
+            assets=cc_assets, shoot_key="new", ensure_job=ensure_job,
+        )
         if "error" in result:
             log(f"  [{job_id}] CC ingest: {result['error']}")
         else:
             cc_accepted = len(result.get("accepted") or [])
             cc_skipped = len(result.get("skipped") or [])
             cc_errors = len(result.get("errors") or [])
+            log(f"  [{job_id}] CC ingest: shootId={result.get('shootId')} "
+                f"resolvedFrom={result.get('resolvedFrom')} "
+                f"acc={cc_accepted} skip={cc_skipped} err={cc_errors}")
 
     log(f"  [{job_id}] uploaded={n_uploaded}  cf_images={n_cf}  posted={n_posted}  "
         f"cc={cc_accepted}/{cc_skipped}/{cc_errors} (acc/skip/err)")
