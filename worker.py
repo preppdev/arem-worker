@@ -51,6 +51,8 @@ import urllib.parse
 
 import requests  # type: ignore  # for Cloudflare Images multipart upload
 
+from pipeline import cc_ingest  # type: ignore  # AREM CC media-ingest POST
+
 # ---- config ----
 DASHBOARD_URL = os.environ.get("DASHBOARD_URL",
     "https://arem-editing-dashboard.vercel.app").rstrip("/")
@@ -656,6 +658,58 @@ def process_job(job: dict) -> dict:
             log(f"  classification: posted {n_cls}/{len(triplets)} records to dashboard")
     except Exception as e:
         log(f"  WARN thumbnail/classification step: {str(e)[:200]}")
+
+    # ── POST per-shoot asset batch to AREM Command Center ──────────────
+    # Only photos with both productionR2Path AND cfImageId qualify —
+    # those are the two CC-required fields for kind=photo. Anything
+    # missing either gets a later reconciliation pass. Best-effort:
+    # transport / 4xx / 5xx are logged and silently swallowed.
+    try:
+        if production_records:
+            classifier_by_stem = {
+                t["stem"]: (t.get("classification") or {})
+                for t in (meta or {}).get("triplets", [])
+                if t.get("stem")
+            } if "meta" in locals() else {}
+
+            cc_assets = []
+            for prod in production_records:
+                if not prod.get("cfImageId") or not prod.get("productionR2Path"):
+                    continue
+                local_file = upright_dir / (f"{prod['midStem']}_stage2-int.jpg"
+                                            if (upright_dir / f"{prod['midStem']}_stage2-int.jpg").is_file()
+                                            else f"{prod['midStem']}_stage2-ext.jpg")
+                width, height = cc_ingest.jpeg_dims(local_file) if local_file.is_file() else (None, None)
+                size_bytes = local_file.stat().st_size if local_file.is_file() else None
+                cls = classifier_by_stem.get(prod["midStem"], {})
+                cc_assets.append({
+                    "kind": "photo",
+                    "sortOrder": prod["sortOrder"],
+                    "r2Bucket": R2_OUTPUT_BUCKET,
+                    "r2Key": prod["productionR2Path"],
+                    "cfImageId": prod["cfImageId"],
+                    "mimeType": "image/jpeg",
+                    "width": width,
+                    "height": height,
+                    "sizeBytes": size_bytes,
+                    "room": cls.get("roomType"),
+                    "isHero": False,
+                    "altText": None,
+                    "caption": None,
+                    "checksum": None,
+                })
+            if cc_assets:
+                result = cc_ingest.post_media(job_id=job_id, assets=cc_assets)
+                if "error" in result:
+                    log(f"  CC ingest: {result['error']}")
+                else:
+                    accepted = len(result.get("accepted") or [])
+                    skipped = len(result.get("skipped") or [])
+                    errors = len(result.get("errors") or [])
+                    log(f"  CC ingest: accepted={accepted} skipped={skipped} "
+                        f"errors={errors}")
+    except Exception as e:
+        log(f"  WARN CC ingest step: {str(e)[:200]}")
 
     # ── Upload Stage-1 NAFNet outputs to R2 (for fine-tune training pairs) ──
     # Gated by UPLOAD_STAGE1=1. run_pipeline.py wrote each pre-Stage-2
