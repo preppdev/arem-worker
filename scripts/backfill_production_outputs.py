@@ -45,6 +45,10 @@ import urllib.error
 
 import requests  # type: ignore  # for CF Images multipart upload
 
+# Make repo root importable so we can `from pipeline import cc_ingest`.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from pipeline import cc_ingest  # type: ignore  # noqa: E402
+
 DASHBOARD_URL = os.environ.get(
     "DASHBOARD_URL", "https://arem-editing-dashboard.vercel.app").rstrip("/")
 WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
@@ -194,12 +198,12 @@ def process_job(job: dict, *, dry_run: bool) -> dict:
                 "dry_run": True}
 
     # Stream-copy each file: Dropbox -> /tmp/<basename> -> r2 (renamed) +
-    # CF Images. Doing per-file (not batch) is required because the
-    # target name encodes sortOrder, and each file needs to be locally
-    # readable for the CF Images upload anyway.
+    # CF Images. Per-file (not batch) because the target name encodes
+    # sortOrder, and CF Images needs a local file handle.
     n_uploaded = 0
     n_cf = 0
     n_posted = 0
+    cc_assets: list[dict] = []
     with tempfile.TemporaryDirectory(prefix="arem-prod-backfill-") as scratch:
         for idx, src_name in enumerate(files, start=1):
             mid_stem = midstem_from_filename(src_name)
@@ -238,11 +242,51 @@ def process_job(job: dict, *, dry_run: bool) -> dict:
                 n_posted += 1
             except Exception as e:
                 log(f"    WARN POST {mid_stem}: {str(e)[:200]}")
+            # Build CC asset record while local file is still on disk —
+            # we need width/height/sizeBytes from it. Only include
+            # assets that have both r2Key and cfImageId (CC's required
+            # fields for kind=photo); the rest get a reconciliation pass.
+            if cf_id:
+                width, height = cc_ingest.jpeg_dims(local)
+                try:
+                    size_bytes = os.path.getsize(local)
+                except OSError:
+                    size_bytes = None
+                cc_assets.append({
+                    "kind": "photo",
+                    "sortOrder": idx,
+                    "r2Bucket": R2_OUTPUT_BUCKET,
+                    "r2Key": r2_key,
+                    "cfImageId": cf_id,
+                    "mimeType": "image/jpeg",
+                    "width": width,
+                    "height": height,
+                    "sizeBytes": size_bytes,
+                    "room": None,            # populated by a later pass
+                    "isHero": False,
+                    "altText": None,
+                    "caption": None,
+                    "checksum": None,
+                })
             os.remove(local)
 
-    log(f"  [{job_id}] uploaded={n_uploaded}  cf_images={n_cf}  posted={n_posted}")
+    # POST the batch to CC. Best-effort: log only.
+    cc_accepted = cc_skipped = cc_errors = 0
+    if cc_assets:
+        result = cc_ingest.post_media(job_id=job_id, assets=cc_assets)
+        if "error" in result:
+            log(f"  [{job_id}] CC ingest: {result['error']}")
+        else:
+            cc_accepted = len(result.get("accepted") or [])
+            cc_skipped = len(result.get("skipped") or [])
+            cc_errors = len(result.get("errors") or [])
+
+    log(f"  [{job_id}] uploaded={n_uploaded}  cf_images={n_cf}  posted={n_posted}  "
+        f"cc={cc_accepted}/{cc_skipped}/{cc_errors} (acc/skip/err)")
     return {"jobId": job_id, "uploaded": n_uploaded, "cf_images": n_cf,
-            "posted": n_posted, "files": len(files)}
+            "posted": n_posted, "files": len(files),
+            "cc_accepted": cc_accepted, "cc_skipped": cc_skipped,
+            "cc_errors": cc_errors}
 
 
 def main() -> int:
@@ -286,8 +330,12 @@ def main() -> int:
     total_uploaded = sum(r.get("uploaded", 0) for r in results)
     total_cf = sum(r.get("cf_images", 0) for r in results)
     total_posted = sum(r.get("posted", 0) for r in results)
+    total_cc_acc = sum(r.get("cc_accepted", 0) for r in results)
+    total_cc_skip = sum(r.get("cc_skipped", 0) for r in results)
+    total_cc_err = sum(r.get("cc_errors", 0) for r in results)
     log(f"\n--- production-output backfill done in {dt:.1f}s ({dt/max(len(jobs),1):.1f}s/job avg) ---")
     log(f"  jobs: {len(jobs)}  r2: {total_uploaded}  cf_images: {total_cf}  posted: {total_posted}")
+    log(f"  cc_ingest: accepted={total_cc_acc}  skipped={total_cc_skip}  errors={total_cc_err}")
     return 0
 
 
