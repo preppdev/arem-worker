@@ -185,7 +185,7 @@ def main() -> int:
         return 2
 
     log(f"production-output backfill: dashboard={DASHBOARD_URL} "
-        f"bucket={R2_OUTPUT_BUCKET} dropbox_folder={DROPBOX_OUTPUT_FOLDER}")
+        f"bucket={R2_OUTPUT_BUCKET}")
 
     listing = get_candidates(limit=args.limit, offset=args.offset,
                              since=args.since, job_id=args.job)
