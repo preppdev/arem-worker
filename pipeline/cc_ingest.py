@@ -118,22 +118,27 @@ def parse_shoot_folder(dropbox_path: str | None) -> dict[str, str | None]:
     return out
 
 
-def build_ensure_job(*, dropbox_path: str | None,
+def build_ensure_job(*, editor_job_id: str | None,
+                     dropbox_path: str | None,
                      photographer: str | None = None,
                      completed_at: str | None = None) -> dict[str, Any]:
-    """Build the ensureJob block from what we have. dropboxPath is the
-    strongest dedup signal — CC matches it exactly first. Address /
-    photographer / completedAt are softer fallbacks."""
+    """Build the ensureJob block from what we have.
+
+    editorJobId is OUR Job.id (cuid). CC dedups in this order:
+      editorJobId → orderId → dropboxPath → address+state+completedAt → create
+    editorJobId is exact-match and the most reliable signal, so we
+    always send it. Address / photographer / completedAt are softer
+    fallbacks for the very first POST before CC has seen this job."""
     parsed = parse_shoot_folder(dropbox_path)
-    return {
+    out: dict[str, Any] = {
+        "editorJobId": editor_job_id,
         "dropboxPath": dropbox_path,
-        "address": parsed["address"],
-        "city": None,
-        "state": None,
-        "zip": None,
         "photographerName": photographer or parsed["photographer"],
         "completedAt": completed_at,
     }
+    if parsed["address"]:
+        out["address"] = parsed["address"]
+    return out
 
 
 def jpeg_dims(local_path: str | Path) -> tuple[int | None, int | None]:
