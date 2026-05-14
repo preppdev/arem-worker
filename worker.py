@@ -699,15 +699,28 @@ def process_job(job: dict) -> dict:
                     "checksum": None,
                 })
             if cc_assets:
-                result = cc_ingest.post_media(job_id=job_id, assets=cc_assets)
+                # CC's Shoot ↔ our Job.id are separate spaces — always
+                # POST to /new with an ensureJob block. CC dedups via
+                # dropboxPath; falls back to address+state+date; failing
+                # both, creates a new Shoot stub.
+                ensure_job = cc_ingest.build_ensure_job(
+                    dropbox_path=job.get("dropboxPath"),
+                    photographer=job.get("photographer"),
+                    completed_at=(job.get("completedAt") if isinstance(job.get("completedAt"), str)
+                                  else None),
+                )
+                result = cc_ingest.post_media(
+                    assets=cc_assets, shoot_key="new", ensure_job=ensure_job,
+                )
                 if "error" in result:
                     log(f"  CC ingest: {result['error']}")
                 else:
                     accepted = len(result.get("accepted") or [])
                     skipped = len(result.get("skipped") or [])
                     errors = len(result.get("errors") or [])
-                    log(f"  CC ingest: accepted={accepted} skipped={skipped} "
-                        f"errors={errors}")
+                    log(f"  CC ingest: shootId={result.get('shootId')} "
+                        f"resolvedFrom={result.get('resolvedFrom')} "
+                        f"accepted={accepted} skipped={skipped} errors={errors}")
     except Exception as e:
         log(f"  WARN CC ingest step: {str(e)[:200]}")
 
