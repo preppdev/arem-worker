@@ -704,6 +704,7 @@ def process_job(job: dict) -> dict:
                 # dropboxPath; falls back to address+state+date; failing
                 # both, creates a new Shoot stub.
                 ensure_job = cc_ingest.build_ensure_job(
+                    editor_job_id=job_id,
                     dropbox_path=job.get("dropboxPath"),
                     photographer=job.get("photographer"),
                     completed_at=(job.get("completedAt") if isinstance(job.get("completedAt"), str)

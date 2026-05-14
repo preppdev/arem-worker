@@ -276,6 +276,7 @@ def process_job(job: dict, *, dry_run: bool) -> dict:
     cc_accepted = cc_skipped = cc_errors = 0
     if cc_assets:
         ensure_job = cc_ingest.build_ensure_job(
+            editor_job_id=job_id,
             dropbox_path=job.get("dropboxPath"),
             photographer=job.get("photographer"),
             completed_at=job.get("completedAt"),
