@@ -1,12 +1,20 @@
-"""Backfill historical production output JPGs into arem-production-edit-jobs.
+"""Backfill historical production output JPGs into arem-production-edit-jobs
++ Cloudflare Images.
 
-For every completed Job in the dashboard's candidate list, copy the
-Dropbox `08-Test-Edit/*.jpg` outputs to r2:<R2_OUTPUT_BUCKET>/jobs/<jobId>/
-and POST each per-image productionR2Path back to
-/api/internal/image-classification.
+For every completed Job in the dashboard's candidate list, this script:
+  1. Pulls each *.jpg from the Dropbox 08-Test-Edit output folder.
+  2. Re-uploads it to r2:<R2_OUTPUT_BUCKET>/tours/<jobId>/photos/<NNNN>-<stem>.jpg
+     (R2-IA archive, multi-year retention).
+  3. Uploads it to Cloudflare Images, capturing the returned cfImageId.
+  4. POSTs (productionR2Path, sortOrder, cfImageId) per-image to
+     /api/internal/image-classification.
 
-No GPU needed — pure rclone + HTTP. Run on any box with rclone configured
-for both dropbox + r2 remotes.
+sortOrder = 1-based ordinal in alphabetical midStem order within the job.
+Stage-2 _stage2-{int|ext} suffix is stripped from the target filename so
+keys read cleanly in the gallery.
+
+No GPU needed — rclone + HTTP. Run on any box with rclone configured for
+dropbox + r2 remotes.
 
 Usage:
     python -m scripts.backfill_production_outputs --limit 50 --since 2025-01-01
@@ -14,11 +22,13 @@ Usage:
     python -m scripts.backfill_production_outputs --dry-run --limit 5
 
 Env:
-    WORKER_TOKEN          dashboard auth (required)
-    DASHBOARD_URL         default https://arem-editing-dashboard.vercel.app
-    R2_OUTPUT_BUCKET      default arem-production-edit-jobs
-    RCLONE_DROPBOX        default 'dropbox'
-    RCLONE_R2             default 'r2'
+    WORKER_TOKEN              dashboard auth (required)
+    DASHBOARD_URL             default https://arem-editing-dashboard.vercel.app
+    R2_OUTPUT_BUCKET          default arem-production-edit-jobs
+    CLOUDFLARE_API_TOKEN      CF Images upload auth (required for CF step)
+    CLOUDFLARE_ACCOUNT_ID     CF account for the Images API endpoint
+    RCLONE_DROPBOX            default 'dropbox'
+    RCLONE_R2                 default 'r2'
 """
 from __future__ import annotations
 
@@ -27,10 +37,13 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 import urllib.request
 import urllib.error
+
+import requests  # type: ignore  # for CF Images multipart upload
 
 DASHBOARD_URL = os.environ.get(
     "DASHBOARD_URL", "https://arem-editing-dashboard.vercel.app").rstrip("/")
@@ -38,6 +51,8 @@ WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
 R2_OUTPUT_BUCKET = os.environ.get("R2_OUTPUT_BUCKET", "arem-production-edit-jobs")
 RCLONE_DROPBOX = os.environ.get("RCLONE_DROPBOX", "dropbox")
 RCLONE_R2 = os.environ.get("RCLONE_R2", "r2")
+CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
 
 
 def log(msg: str) -> None:
@@ -99,72 +114,135 @@ def midstem_from_filename(name: str) -> str:
     return stem
 
 
+def cf_images_upload(local_path: str, *, job_id: str, mid_stem: str,
+                     sort_order: int) -> str | None:
+    """POST a JPG to Cloudflare Images. Returns the cfImageId on success,
+    None on any failure (logged). The R2 archive is already durable by
+    the time we get here, so CF Images is recoverable via a later
+    reconciliation pass."""
+    if not CLOUDFLARE_API_TOKEN or not CLOUDFLARE_ACCOUNT_ID:
+        return None
+    url = (f"https://api.cloudflare.com/client/v4/accounts/"
+           f"{CLOUDFLARE_ACCOUNT_ID}/images/v1")
+    meta = json.dumps({
+        "src": "backfill_production_outputs",
+        "jobId": job_id,
+        "midStem": mid_stem,
+        "sortOrder": sort_order,
+    })
+    try:
+        with open(local_path, "rb") as f:
+            files = {
+                "file": (os.path.basename(local_path), f, "image/jpeg"),
+                "metadata": (None, meta, "application/json"),
+            }
+            resp = requests.post(
+                url,
+                headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"},
+                files=files,
+                timeout=60,
+            )
+    except Exception as e:
+        log(f"    WARN CF Images upload {mid_stem}: {str(e)[:200]}")
+        return None
+    if resp.status_code != 200:
+        log(f"    WARN CF Images upload {mid_stem}: HTTP {resp.status_code} "
+            f"{resp.text[:200]}")
+        return None
+    try:
+        return resp.json()["result"]["id"]
+    except Exception as e:
+        log(f"    WARN CF Images parse {mid_stem}: {str(e)[:200]}")
+        return None
+
+
 def process_job(job: dict, *, dry_run: bool) -> dict:
     job_id = job["id"]
     out = job.get("outputLocation") or {}
     if out.get("kind") != "dropbox":
-        # Manual-upload jobs already write to R2 (arem-editing-images);
-        # they're not in scope for this backfill which targets the
-        # Dropbox 08-Test-Edit -> arem-production-edit-jobs pipeline.
         log(f"  [{job_id}] non-dropbox output ({out.get('kind')}) — skip")
         return {"jobId": job_id, "skipped": "non-dropbox"}
 
     # outputLocation.path from the dashboard already includes the
     # 08-Test-Edit suffix — don't append it again.
     dropbox_src = resolve_dropbox(out["path"])
-    r2_dst = f"{RCLONE_R2}:{R2_OUTPUT_BUCKET}/jobs/{job_id}"
 
-    # List the Dropbox source first — empty source = nothing to do.
+    # List the Dropbox source. Skip jobs whose 08-Test-Edit was deleted
+    # or never existed.
     ls = rclone(["lsf", dropbox_src, "--include", "*.jpg"], timeout=60)
     if ls.returncode != 0:
         log(f"  [{job_id}] dropbox lsf failed rc={ls.returncode}: "
             f"{ls.stderr[-200:].strip()}")
         return {"jobId": job_id, "skipped": "lsf-failed"}
-    files = [f.strip() for f in ls.stdout.splitlines() if f.strip().endswith(".jpg")]
+    files = sorted(
+        f.strip() for f in ls.stdout.splitlines() if f.strip().endswith(".jpg")
+    )
+    # Sort by stripped-midStem so sortOrder is deterministic across re-runs.
+    files = sorted(files, key=midstem_from_filename)
     if not files:
         log(f"  [{job_id}] no JPGs at {dropbox_src} — skip")
         return {"jobId": job_id, "skipped": "empty"}
 
-    log(f"  [{job_id}] {len(files)} JPGs → {r2_dst}")
+    log(f"  [{job_id}] {len(files)} JPGs")
     if dry_run:
-        for f in files[:3]:
-            log(f"    [dry]   {f} -> jobs/{job_id}/{f}")
+        for idx, f in enumerate(files[:3], 1):
+            stem = midstem_from_filename(f)
+            log(f"    [dry]   {f} -> tours/{job_id}/photos/{idx:04d}-{stem}.jpg")
         if len(files) > 3:
             log(f"    [dry]   ... + {len(files) - 3} more")
         return {"jobId": job_id, "uploaded": 0, "posted": 0, "files": len(files),
                 "dry_run": True}
 
-    # Copy whole folder — rclone handles parallelism + idempotency.
-    cp = rclone(["copy", dropbox_src, r2_dst,
-                 "--include", "*.jpg",
-                 "--transfers", "8", "--checkers", "8"],
-                timeout=1800)
-    if cp.returncode != 0:
-        log(f"  [{job_id}] WARN copy rc={cp.returncode}: {cp.stderr[-200:].strip()}")
-        return {"jobId": job_id, "uploaded": 0, "posted": 0, "files": len(files),
-                "error": f"rclone rc={cp.returncode}"}
-
-    # POST per-file productionR2Path. ImageReview keys are on midStem,
-    # but a Job can emit BOTH <stem>_stage2-int.jpg AND <stem>_stage2-ext.jpg
-    # for the same stem — last write wins, which is fine since each is
-    # a complete final delivered JPG; the dashboard / virtual tour
-    # platform doesn't care which variant is referenced.
+    # Stream-copy each file: Dropbox -> /tmp/<basename> -> r2 (renamed) +
+    # CF Images. Doing per-file (not batch) is required because the
+    # target name encodes sortOrder, and each file needs to be locally
+    # readable for the CF Images upload anyway.
+    n_uploaded = 0
+    n_cf = 0
     n_posted = 0
-    for f in files:
-        stem = midstem_from_filename(f)
-        try:
-            post_production({
-                "jobId": job_id,
-                "midStem": stem,
-                "productionR2Path": f"jobs/{job_id}/{f}",
-            })
-            n_posted += 1
-        except Exception as e:
-            log(f"  [{job_id}] WARN POST {stem}: {str(e)[:200]}")
+    with tempfile.TemporaryDirectory(prefix="arem-prod-backfill-") as scratch:
+        for idx, src_name in enumerate(files, start=1):
+            mid_stem = midstem_from_filename(src_name)
+            local = os.path.join(scratch, src_name)
+            # Pull from Dropbox to scratch
+            cp_in = rclone(["copyto", f"{dropbox_src}/{src_name}", local,
+                            "--progress=false"], timeout=180)
+            if cp_in.returncode != 0:
+                log(f"    WARN dropbox→scratch {src_name}: rc={cp_in.returncode} "
+                    f"{cp_in.stderr[-160:].strip()}")
+                continue
+            # Push to R2 under the canonical key shape
+            r2_key = f"tours/{job_id}/photos/{idx:04d}-{mid_stem}.jpg"
+            cp_out = rclone(["copyto", local,
+                             f"{RCLONE_R2}:{R2_OUTPUT_BUCKET}/{r2_key}",
+                             "--progress=false"], timeout=180)
+            if cp_out.returncode != 0:
+                log(f"    WARN scratch→r2 {mid_stem}: rc={cp_out.returncode} "
+                    f"{cp_out.stderr[-160:].strip()}")
+                continue
+            n_uploaded += 1
+            # CF Images
+            cf_id = cf_images_upload(local, job_id=job_id, mid_stem=mid_stem,
+                                     sort_order=idx)
+            if cf_id:
+                n_cf += 1
+            # Dashboard POST
+            try:
+                post_production({
+                    "jobId": job_id,
+                    "midStem": mid_stem,
+                    "productionR2Path": r2_key,
+                    "sortOrder": idx,
+                    "cfImageId": cf_id,
+                })
+                n_posted += 1
+            except Exception as e:
+                log(f"    WARN POST {mid_stem}: {str(e)[:200]}")
+            os.remove(local)
 
-    log(f"  [{job_id}] uploaded {len(files)}  posted {n_posted}")
-    return {"jobId": job_id, "uploaded": len(files), "posted": n_posted,
-            "files": len(files)}
+    log(f"  [{job_id}] uploaded={n_uploaded}  cf_images={n_cf}  posted={n_posted}")
+    return {"jobId": job_id, "uploaded": n_uploaded, "cf_images": n_cf,
+            "posted": n_posted, "files": len(files)}
 
 
 def main() -> int:
@@ -206,9 +284,10 @@ def main() -> int:
 
     dt = time.time() - t0
     total_uploaded = sum(r.get("uploaded", 0) for r in results)
+    total_cf = sum(r.get("cf_images", 0) for r in results)
     total_posted = sum(r.get("posted", 0) for r in results)
     log(f"\n--- production-output backfill done in {dt:.1f}s ({dt/max(len(jobs),1):.1f}s/job avg) ---")
-    log(f"  jobs: {len(jobs)}  uploaded: {total_uploaded}  posted: {total_posted}")
+    log(f"  jobs: {len(jobs)}  r2: {total_uploaded}  cf_images: {total_cf}  posted: {total_posted}")
     return 0
 
 
