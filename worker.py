@@ -560,6 +560,20 @@ def process_job(job: dict) -> dict:
     # The make-up's own job.id stays the status-update target so we
     # can track the audit trail; everything else routes to parentJobId.
     makeup = job.get("makeup") or None
+    # Source=makeup MUST come with an unwrap envelope from the claim
+    # endpoint. If the envelope is missing or only contains an error
+    # field (e.g. a Vercel function instance ran stale claim code
+    # during a deploy roll-out), refuse to process — falling through
+    # to the else: branch would use the synthetic _makeup/<parent>/<N>
+    # path and trash the Job with a misleading "Dropbox folder not
+    # found" error.
+    if job.get("source") == "makeup":
+        if not makeup or makeup.get("error") or not makeup.get("inputPathOverride"):
+            raise RuntimeError(
+                f"make-up Job claimed without a valid envelope "
+                f"(got makeup={makeup!r}). "
+                f"Dashboard claim endpoint may have served stale code; retry."
+            )
     effective_job_id = makeup["parentJobId"] if makeup else job_id
     skip_mid_stems: set[str] = (
         set(makeup.get("alreadyDoneMidStems") or []) if makeup else set()
