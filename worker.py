@@ -444,15 +444,26 @@ def _cf_images_upload(local_path: Path, *, job_id: str, mid_stem: str,
         return None
 
 
-def upload_outputs_production_r2(local_dir: Path, job_id: str) -> list[dict]:
+def upload_outputs_production_r2(
+    local_dir: Path,
+    job_id: str,
+    *,
+    sort_order_start: int = 1,
+    skip_mid_stems: set[str] | None = None,
+) -> list[dict]:
     """Push the final JPGs to the production output bucket + Cloudflare
     Images and return one record per uploaded image.
 
     R2 key shape (new spec):
       tours/<jobId>/photos/<sortOrder:04d>-<midStem>.jpg
 
-    sortOrder is a 1-based ordinal computed from alphabetical midStem
-    order within the job. The bucket is configured at R2-IA storage class.
+    Args:
+      sort_order_start: 1-based starting ordinal. Make-up jobs pass the
+        parent's next-available value here so new stems land after the
+        existing ones.
+      skip_mid_stems: stems already covered on the parent (make-up only);
+        we don't re-upload these even though inference re-ran on them.
+        Saves Cloudflare Images quota and avoids cfImageId duplicates.
 
     Returns: list of {midStem, sortOrder, productionR2Path, cfImageId}.
     Best-effort: an exception in this function is reported up so the
@@ -461,16 +472,20 @@ def upload_outputs_production_r2(local_dir: Path, job_id: str) -> list[dict]:
     """
     if not R2_OUTPUT_BUCKET:
         return []
-    # Build the (midStem, source_path, target_filename) list in sortOrder.
-    # The worker emits '<stem>_stage2-{int|ext}.jpg' but we drop the suffix
-    # in the delivered filename — the CC ingest contract expects the
-    # original frame name.
+    skip = skip_mid_stems or set()
+    # Sort by stripped mid-stem so sortOrder follows alphabetical order
+    # of the FINAL frame names; the make-up's filter excludes anything
+    # that already has a productionR2Path on the parent.
     jpgs = sorted(local_dir.glob("*.jpg"), key=lambda p: _strip_stage2_suffix(p.stem))
-    if not jpgs:
+    new_jpgs = [p for p in jpgs if _strip_stage2_suffix(p.stem) not in skip]
+    if not new_jpgs:
+        if skip:
+            log(f"    production R2: all {len(jpgs)} stems already covered — nothing to upload")
         return []
 
     records: list[dict] = []
-    for idx, p in enumerate(jpgs, start=1):
+    for offset, p in enumerate(new_jpgs):
+        idx = sort_order_start + offset
         mid_stem = _strip_stage2_suffix(p.stem)
         target_name = f"{idx:04d}-{mid_stem}.jpg"
         r2_key = f"tours/{job_id}/photos/{target_name}"
@@ -532,6 +547,25 @@ def process_job(job: dict) -> dict:
     stored_path = job["dropboxPath"]
     manual = job.get("manualUpload")  # None for normal Dropbox jobs
 
+    # Make-up jobs (source=makeup, created by the watchdog) carry a
+    # synthetic dropboxPath. The claim endpoint resolves it for us and
+    # returns:
+    #   makeup = {
+    #     parentJobId,            # all per-image artifacts go here
+    #     inputPathOverride,      # real Dropbox folder to download from
+    #     alreadyDoneMidStems[],  # skip these at upload time
+    #     nextSortOrder,          # append-after-highest for new R2 keys
+    #     attempt,
+    #   }
+    # The make-up's own job.id stays the status-update target so we
+    # can track the audit trail; everything else routes to parentJobId.
+    makeup = job.get("makeup") or None
+    effective_job_id = makeup["parentJobId"] if makeup else job_id
+    skip_mid_stems: set[str] = (
+        set(makeup.get("alreadyDoneMidStems") or []) if makeup else set()
+    )
+    sort_order_start = (makeup.get("nextSortOrder") or 1) if makeup else 1
+
     work = WORK_ROOT / job_id
     raw_dir = work / "raws"
     pred_root = work / "predictions"
@@ -544,6 +578,17 @@ def process_job(job: dict) -> dict:
         log("  [1/4] fetching inputs from R2")
         n_arws, total_bytes = download_manual_inputs(inputs, raw_dir)
         raw_subfolder = "manual_upload"
+    elif makeup:
+        # Pull RAWs from the parent's real Dropbox folder. Output also
+        # lands in the parent's 08-Test-Edit (rclone copy is content-
+        # aware, so re-uploading existing JPGs is a no-op).
+        dropbox_path = resolve_dropbox_source(makeup["inputPathOverride"])
+        log(f"job {job_id}: make-up #{makeup.get('attempt')} of parent "
+            f"{effective_job_id}; src={dropbox_path}; "
+            f"skip={len(skip_mid_stems)} already-done stems; "
+            f"nextSortOrder={sort_order_start}")
+        log("  [1/4] downloading ARWs")
+        n_arws, total_bytes, raw_subfolder = download_raws(dropbox_path, raw_dir)
     else:
         dropbox_path = resolve_dropbox_source(stored_path)
         log(f"job {job_id}: {dropbox_path}")
@@ -568,21 +613,31 @@ def process_job(job: dict) -> dict:
         production_records: list[dict] = []
     else:
         log(f"  [4/4] uploading to {DROPBOX_OUTPUT_FOLDER}")
+        # Dropbox upload is content-aware (rclone copy skips identical
+        # files), so make-ups re-uploading already-done stems is a no-op.
         n_jpg = upload_outputs(upright_dir, dropbox_path)
         output_keys = None
 
         # Dual-write the same JPGs to the production output bucket +
-        # Cloudflare Images. Best-effort: an exception here is logged
-        # as a warning but does NOT roll back the Dropbox upload or
-        # fail the job. The per-image POST happens later in the
-        # thumbnail block so we reuse the same records list.
+        # Cloudflare Images. For make-up jobs:
+        #   - effective_job_id = parent's id (R2 prefix routes there)
+        #   - skip_mid_stems = stems already covered on the parent
+        #   - sort_order_start = parent's next-available sortOrder
+        # so the make-up's new stems append cleanly. Best-effort: an
+        # exception here is logged as a warning but does NOT roll back
+        # the Dropbox upload or fail the job.
         production_records = []
         if R2_OUTPUT_BUCKET:
             try:
-                production_records = upload_outputs_production_r2(upright_dir, job_id)
+                production_records = upload_outputs_production_r2(
+                    upright_dir,
+                    effective_job_id,
+                    sort_order_start=sort_order_start,
+                    skip_mid_stems=skip_mid_stems,
+                )
                 n_cf = sum(1 for r in production_records if r.get("cfImageId"))
                 log(f"    production dual-write: {len(production_records)} files → "
-                    f"r2:{R2_OUTPUT_BUCKET}/tours/{job_id}/photos/  "
+                    f"r2:{R2_OUTPUT_BUCKET}/tours/{effective_job_id}/photos/  "
                     f"cf_images={n_cf}/{len(production_records)}")
             except Exception as e:
                 log(f"  WARN production dual-write: {str(e)[:200]}")
@@ -619,7 +674,11 @@ def process_job(job: dict) -> dict:
         thumbs_dir = pred_root / "_thumbnails"
         triplets = (meta or {}).get("triplets", []) if "meta" in locals() else []
         if thumbs_dir.is_dir() and triplets:
-            r2_prefix = f"r2:arem-training-data/image-thumbnails/{job_id}"
+            # Make-up: route thumbnails + classification POSTs to the
+            # parent's job id. Also skip stems that already exist on
+            # the parent (we don't want to overwrite the reviewer-
+            # corrected classification fields on already-finished rows).
+            r2_prefix = f"r2:arem-training-data/image-thumbnails/{effective_job_id}"
             r2_upload = rclone(
                 ["copy", str(thumbs_dir), r2_prefix,
                  "--transfers", "8", "--checkers", "8"],
@@ -632,16 +691,20 @@ def process_job(job: dict) -> dict:
             # sortOrder, cfImageId).
             production_by_stem = {r["midStem"]: r for r in production_records}
             n_cls = 0
+            n_skipped_existing = 0
             for t in triplets:
                 stem = t.get("stem")
                 cls = t.get("classification")
                 if not stem or not cls:
                     continue
-                thumb_key = f"image-thumbnails/{job_id}/{stem}.jpg"
+                if stem in skip_mid_stems:
+                    n_skipped_existing += 1
+                    continue
+                thumb_key = f"image-thumbnails/{effective_job_id}/{stem}.jpg"
                 prod = production_by_stem.get(stem) or {}
                 try:
                     _post("/api/internal/image-classification", {
-                        "jobId": job_id,
+                        "jobId": effective_job_id,
                         "midStem": stem,
                         "isInteriorWorker": cls.get("isInterior"),
                         "roomTypeWorker": cls.get("roomType"),
@@ -655,7 +718,8 @@ def process_job(job: dict) -> dict:
                     n_cls += 1
                 except Exception as e:
                     log(f"  WARN classification POST for {stem}: {str(e)[:200]}")
-            log(f"  classification: posted {n_cls}/{len(triplets)} records to dashboard")
+            log(f"  classification: posted {n_cls}/{len(triplets)} records to dashboard"
+                + (f" (skipped {n_skipped_existing} already-done stems)" if n_skipped_existing else ""))
     except Exception as e:
         log(f"  WARN thumbnail/classification step: {str(e)[:200]}")
 
@@ -701,11 +765,16 @@ def process_job(job: dict) -> dict:
             if cc_assets:
                 # CC's Shoot ↔ our Job.id are separate spaces — always
                 # POST to /new with an ensureJob block. CC dedups via
-                # dropboxPath; falls back to address+state+date; failing
-                # both, creates a new Shoot stub.
+                # editorJobId (most reliable, exact match on parent's
+                # job id); falls back to dropboxPath; then address.
+                # Make-ups use the parent's identity (editorJobId =
+                # parent's id, dropboxPath = parent's real folder) so
+                # the new assets attach to the existing CC shoot.
                 ensure_job = cc_ingest.build_ensure_job(
-                    editor_job_id=job_id,
-                    dropbox_path=job.get("dropboxPath"),
+                    editor_job_id=effective_job_id,
+                    dropbox_path=(
+                        makeup["inputPathOverride"] if makeup else job.get("dropboxPath")
+                    ),
                     photographer=job.get("photographer"),
                     completed_at=(job.get("completedAt") if isinstance(job.get("completedAt"), str)
                                   else None),
@@ -747,7 +816,10 @@ def process_job(job: dict) -> dict:
                         shutil.copyfile(p, renamed_dir / f"{stem}.jpg")
                         n_renamed += 1
                 if n_renamed > 0:
-                    r2_prefix = f"r2:arem-training-data/training-stage1/{job_id}"
+                    # Make-ups: route stage1 R2 keys + DB posts to the
+                    # parent's id so training-pair assembly joins
+                    # cleanly with the parent's existing stage1 outputs.
+                    r2_prefix = f"r2:arem-training-data/training-stage1/{effective_job_id}"
                     r = rclone(
                         ["copy", str(renamed_dir), r2_prefix,
                          "--transfers", "8", "--checkers", "8"],
@@ -765,11 +837,13 @@ def process_job(job: dict) -> dict:
                             if not p.is_file():
                                 continue
                             stem = p.stem
+                            if stem in skip_mid_stems:
+                                continue  # parent already has this stage1 row
                             try:
                                 _post("/api/internal/image-classification", {
-                                    "jobId": job_id,
+                                    "jobId": effective_job_id,
                                     "midStem": stem,
-                                    "stage1R2Path": f"training-stage1/{job_id}/{stem}.jpg",
+                                    "stage1R2Path": f"training-stage1/{effective_job_id}/{stem}.jpg",
                                 })
                                 n_posted += 1
                             except Exception as e:
