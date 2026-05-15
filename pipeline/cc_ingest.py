@@ -128,17 +128,23 @@ def build_ensure_job(*, editor_job_id: str | None,
       editorJobId → orderId → dropboxPath → address+state+completedAt → create
     editorJobId is exact-match and the most reliable signal, so we
     always send it. Address / photographer / completedAt are softer
-    fallbacks for the very first POST before CC has seen this job."""
+    fallbacks for the very first POST before CC has seen this job.
+
+    CC's Zod schema rejects null values on optional fields — only
+    include keys whose value is non-empty. completedAt falls back to
+    "now" (UTC) when not provided since the live worker POSTs at job-
+    completion time and Job.completedAt isn't set yet at that moment.
+    """
     parsed = parse_shoot_folder(dropbox_path)
+    now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00", "Z")
     out: dict[str, Any] = {
         "editorJobId": editor_job_id,
         "dropboxPath": dropbox_path,
         "photographerName": photographer or parsed["photographer"],
-        "completedAt": completed_at,
+        "completedAt": completed_at or now_iso,
+        "address": parsed["address"],
     }
-    if parsed["address"]:
-        out["address"] = parsed["address"]
-    return out
+    return {k: v for k, v in out.items() if v is not None and v != ""}
 
 
 def jpeg_dims(local_path: str | Path) -> tuple[int | None, int | None]:
