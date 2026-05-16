@@ -109,25 +109,26 @@ def iou(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def get_model_versions(condition: str) -> list[str]:
-    """Pull distinct model versions for the condition from the public
-    auto-mask summary endpoint (cookie-auth in browser; we hit the
-    internal route that the gallery uses). We just need the list of
-    model versions to iterate; the summary itself isn't strictly
-    needed."""
-    sp = urllib.parse.urlencode({"limit": "1"})
-    data = _request("GET", f"/api/auto-mask/{condition}?{sp}")
-    return [s["modelVersion"] for s in data.get("summary", [])]
+    """Distinct model versions for the condition. Uses the worker-token
+    internal mirror because the public /api/auto-mask/<condition> route
+    is gated by the password proxy."""
+    sp = urllib.parse.urlencode({"condition": condition, "listModels": "true"})
+    data = _request("GET", f"/api/internal/auto-mask-rows?{sp}")
+    return [it["modelVersion"] for it in data.get("items", [])]
 
 
 def get_automask_rows(condition: str, model_version: str,
                       image_paths: list[str]) -> dict[str, str | None]:
     """Return {imageR2Path: autoMaskR2Path|None} for the given truth
-    images. Uses the /api/auto-mask/<condition> endpoint with the
-    modelVersion filter and onlyHits=false. Caller only consumes rows
-    whose imageR2Path is in image_paths."""
+    images. Pulls every row for (condition, modelVersion) via the
+    internal mirror and filters client-side."""
     out: dict[str, str | None] = {}
-    sp = urllib.parse.urlencode({"modelVersion": model_version, "limit": "500"})
-    data = _request("GET", f"/api/auto-mask/{condition}?{sp}")
+    sp = urllib.parse.urlencode({
+        "condition": condition,
+        "modelVersion": model_version,
+        "limit": "2000",
+    })
+    data = _request("GET", f"/api/internal/auto-mask-rows?{sp}")
     truth_set = set(image_paths)
     for r in data.get("items", []):
         if r["imageR2Path"] in truth_set:

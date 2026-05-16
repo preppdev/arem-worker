@@ -202,7 +202,23 @@ def main() -> int:
                     help="N oldest hand-labels to hold out as eval (not used "
                          "for the feature bank)")
     ap.add_argument("--score-threshold", type=float, default=0.05,
-                    help="positive_max_sim - negative_max_sim threshold")
+                    help="threshold on the per-patch score; meaning depends "
+                         "on --score-mode")
+    ap.add_argument("--score-mode", choices=("pos_minus_neg", "pos_only"),
+                    default="pos_only",
+                    help="pos_minus_neg: score = topk_pos_sim - topk_neg_sim "
+                         "(original; sensitive to class imbalance). "
+                         "pos_only: score = topk_pos_sim. Recommended when the "
+                         "positive bank is small vs the negative bank. "
+                         "Try --score-threshold 0.65-0.80 with this mode.")
+    ap.add_argument("--negatives-from", choices=("rejected", "rejected_and_bg"),
+                    default="rejected",
+                    help="rejected: only use full-image features from rejected "
+                         "labels (no-condition images) as negatives. "
+                         "rejected_and_bg: also include patches outside the mask "
+                         "in positive images (original behavior; problematic "
+                         "because those patches still contain the reflective "
+                         "surfaces we want to find).")
     ap.add_argument("--topk-pos", type=int, default=3)
     ap.add_argument("--topk-neg", type=int, default=3)
     ap.add_argument("--limit", type=int, default=500,
@@ -227,7 +243,12 @@ def main() -> int:
         log("ERROR: WORKER_TOKEN env var is required")
         return 2
 
-    tag = args.tag or f"h{args.heldout}_t{int(args.score_threshold*100):02d}"
+    mode_short = {"pos_only": "p", "pos_minus_neg": "d"}[args.score_mode]
+    neg_short = {"rejected": "rej", "rejected_and_bg": "bg"}[args.negatives_from]
+    tag = args.tag or (
+        f"h{args.heldout}_{mode_short}{int(args.score_threshold*100):02d}"
+        f"_{neg_short}"
+    )
     safe_model = re.sub(r"[^a-z0-9]+", "-",
                         args.dinov2.split("/")[-1].lower()).strip("-")
     model_version = f"{safe_model}-fewshot__{tag}"
@@ -251,6 +272,7 @@ def main() -> int:
     log("\n  building feature bank from train pairs ...")
     pos_chunks: list[torch.Tensor] = []
     neg_chunks: list[torch.Tensor] = []
+    use_bg_negatives = args.negatives_from == "rejected_and_bg"
     with tempfile.TemporaryDirectory(prefix="arem-fewshot-bank-") as scratch:
         sp = Path(scratch)
         for i, r in enumerate(train_rows, start=1):
@@ -269,11 +291,14 @@ def main() -> int:
                 feats_flat = feats.view(-1, feats.shape[-1])  # (G*G, D)
                 grid_flat = torch.from_numpy(grid.reshape(-1)).to(args.device)
                 pos = feats_flat[grid_flat]
-                neg = feats_flat[~grid_flat]
                 pos_chunks.append(pos)
-                neg_chunks.append(neg)
+                if use_bg_negatives:
+                    neg = feats_flat[~grid_flat]
+                    neg_chunks.append(neg)
                 log(f"    [{i}/{len(train_rows)}] {r['imageR2Path'].rsplit('/', 1)[-1]}: "
-                    f"pos={pos.shape[0]} neg={neg.shape[0]}")
+                    f"pos={pos.shape[0]}"
+                    + (f" neg={pos.shape[0] if not use_bg_negatives else feats_flat.shape[0] - pos.shape[0]}"
+                       if use_bg_negatives else ""))
             except Exception as e:
                 log(f"    WARN bank build {r['imageR2Path']}: {e}")
 
@@ -310,9 +335,12 @@ def main() -> int:
                     log(f"    WARN reject {r['imageR2Path']}: {e}")
 
     pos_bank = torch.cat(pos_chunks, dim=0)
-    neg_bank = torch.cat(neg_chunks, dim=0)
+    neg_bank = (
+        torch.cat(neg_chunks, dim=0) if neg_chunks
+        else torch.empty((0, pos_bank.shape[1]), device=args.device)
+    )
     log(f"\n  bank: pos={pos_bank.shape[0]}  neg={neg_bank.shape[0]}  "
-        f"dim={pos_bank.shape[1]}")
+        f"dim={pos_bank.shape[1]}  mode={args.score_mode}")
 
     # ---- Predict on all candidates ----
     candidates = get_candidates(condition=args.condition,
@@ -352,8 +380,11 @@ def main() -> int:
                     feats = feat.features(im)  # (G, G, D)
                 q = feats.view(-1, feats.shape[-1])  # (G*G, D)
                 pos_s = cosine_scores(q, pos_bank, topk=args.topk_pos)
-                neg_s = cosine_scores(q, neg_bank, topk=args.topk_neg)
-                score = (pos_s - neg_s).view(args.grid, args.grid)
+                if args.score_mode == "pos_minus_neg":
+                    neg_s = cosine_scores(q, neg_bank, topk=args.topk_neg)
+                    score = (pos_s - neg_s).view(args.grid, args.grid)
+                else:
+                    score = pos_s.view(args.grid, args.grid)
                 binary = (score > args.score_threshold).cpu().numpy()
                 # Upsample to original resolution via PIL NEAREST
                 mask = Image.fromarray((binary.astype(np.uint8) * 255), mode="L")
