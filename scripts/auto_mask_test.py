@@ -45,6 +45,7 @@ import numpy as np  # type: ignore
 import torch  # type: ignore
 import torch.nn.functional as F  # type: ignore
 from PIL import Image  # type: ignore
+from scipy import ndimage  # type: ignore
 from transformers import CLIPSegForImageSegmentation, CLIPSegProcessor  # type: ignore
 
 DASHBOARD_URL = os.environ.get(
@@ -134,6 +135,29 @@ def load_clipseg(model_id: str, device: str):
     return model, processor
 
 
+def filter_by_brightness(image: Image.Image, mask: Image.Image,
+                         max_luminance: int) -> Image.Image:
+    """Keep only connected components of the mask whose mean Rec. 709
+    luminance is below max_luminance (0-255). For dead-fixture: a
+    fixture-shaped CLIPSeg mask is true on every fixture; this drops
+    components that are bright (lit) and keeps dark ones (unlit)."""
+    img_arr = np.asarray(image.convert("RGB"), dtype=np.float32)
+    lum = (0.2126 * img_arr[..., 0]
+           + 0.7152 * img_arr[..., 1]
+           + 0.0722 * img_arr[..., 2])
+    mask_arr = np.asarray(mask, dtype=np.uint8) > 0
+    labels, n = ndimage.label(mask_arr)
+    if n == 0:
+        return mask
+    keep = np.zeros_like(mask_arr)
+    for i in range(1, n + 1):
+        comp = labels == i
+        if lum[comp].mean() < max_luminance:
+            keep[comp] = True
+    out = (keep.astype(np.uint8) * 255)
+    return Image.fromarray(out, mode="L")
+
+
 def clipseg_segment(model, processor, image: Image.Image, prompt: str,
                     device: str, threshold: float = 0.5) -> Image.Image:
     """Run CLIPSeg with a text prompt and return a binary L-mode mask
@@ -174,6 +198,11 @@ def main() -> int:
                          "shows as a separate chip on the dashboard")
     ap.add_argument("--threshold", type=float, default=0.5,
                     help="probability threshold for binary mask (0-1)")
+    ap.add_argument("--brightness-filter", action="store_true",
+                    help="post-filter: keep only mask blobs whose mean Rec. 709 "
+                         "luminance is below --brightness-max (use for dead-fixture)")
+    ap.add_argument("--brightness-max", type=int, default=120,
+                    help="luminance ceiling 0-255 for --brightness-filter")
     ap.add_argument("--limit", type=int, default=500)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
@@ -184,11 +213,12 @@ def main() -> int:
 
     prompt = args.prompt or args.condition
     base_model_id = safe_model_id(args.model)
+    suffix_parts: list[str] = []
     if args.tag:
-        tag_clean = re.sub(r"[^a-z0-9]+", "-", args.tag.lower()).strip("-")
-        model_id = f"{base_model_id}__{tag_clean}"
-    else:
-        model_id = base_model_id
+        suffix_parts.append(re.sub(r"[^a-z0-9]+", "-", args.tag.lower()).strip("-"))
+    if args.brightness_filter:
+        suffix_parts.append(f"lumLT{args.brightness_max}")
+    model_id = base_model_id + ("__" + "__".join(suffix_parts) if suffix_parts else "")
     log(f"auto-mask test: condition={args.condition} model_id={model_id} "
         f"prompt='{prompt}' device={args.device}")
 
@@ -228,6 +258,8 @@ def main() -> int:
                         model, processor, im, prompt, args.device,
                         threshold=args.threshold,
                     )
+                    if args.brightness_filter:
+                        mask = filter_by_brightness(im, mask, args.brightness_max)
                 px = int(np.asarray(mask, dtype=np.uint8).sum() // 255)
                 mask_path: str | None = None
                 if px > 0:
