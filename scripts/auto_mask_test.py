@@ -168,6 +168,10 @@ def main() -> int:
                     help="HF repo id for the CLIPSeg segmenter")
     ap.add_argument("--prompt", default=None,
                     help="text prompt; defaults to the condition name")
+    ap.add_argument("--tag", default=None,
+                    help="suffix appended to model_version (e.g. 'photog') so "
+                         "each prompt experiment gets its own dedup bucket and "
+                         "shows as a separate chip on the dashboard")
     ap.add_argument("--threshold", type=float, default=0.5,
                     help="probability threshold for binary mask (0-1)")
     ap.add_argument("--limit", type=int, default=500)
@@ -179,7 +183,12 @@ def main() -> int:
         return 2
 
     prompt = args.prompt or args.condition
-    model_id = safe_model_id(args.model)
+    base_model_id = safe_model_id(args.model)
+    if args.tag:
+        tag_clean = re.sub(r"[^a-z0-9]+", "-", args.tag.lower()).strip("-")
+        model_id = f"{base_model_id}__{tag_clean}"
+    else:
+        model_id = base_model_id
     log(f"auto-mask test: condition={args.condition} model_id={model_id} "
         f"prompt='{prompt}' device={args.device}")
 
