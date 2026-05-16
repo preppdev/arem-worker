@@ -208,7 +208,11 @@ def main() -> int:
     ap.add_argument("--dino-threshold", type=float, default=0.15,
                     help="threshold on (1 - cosine); higher = require larger "
                          "feature shift. 0.15 ≈ cosine<0.85.")
-    ap.add_argument("--combine", choices=("and", "or"), default="and")
+    ap.add_argument("--combine", choices=("and", "or", "dino_only", "ssim_only"),
+                    default="and",
+                    help="how to combine SSIM + DINOv2 diff maps. dino_only "
+                         "skips SSIM entirely (use when SSIM is dominated by "
+                         "JPEG/compression noise rather than real edits).")
     ap.add_argument("--open-radius", type=int, default=3,
                     help="binary opening radius to remove salt noise")
     ap.add_argument("--close-radius", type=int, default=7,
@@ -216,6 +220,12 @@ def main() -> int:
     ap.add_argument("--min-area", type=int, default=200,
                     help="drop connected components smaller than this many "
                          "pixels (at target_width resolution)")
+    ap.add_argument("--keep-largest", type=int, default=0,
+                    help="if >0, keep only the N largest connected components "
+                         "after morphology. AutoHDR touches many regions of "
+                         "each image; keeping the largest blob isolates the "
+                         "dominant local edit (often the condition we care "
+                         "about). 0 disables.")
     ap.add_argument("--limit", type=int, default=500)
     ap.add_argument("--tag", default=None)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -230,6 +240,8 @@ def main() -> int:
         f"ssim{int(args.ssim_threshold*100):02d}"
         f"_dino{int(args.dino_threshold*100):02d}"
         f"_{args.combine}"
+        + (f"_k{args.keep_largest}" if args.keep_largest > 0 else "")
+        + (f"_a{args.min_area}" if args.min_area > 200 else "")
     )
     model_version = f"diff__{tag}"
     log(f"pseudo-label diff: condition={args.condition} "
@@ -279,20 +291,33 @@ def main() -> int:
                     im_v = im_v.convert("RGB")
                     orig_w, orig_h = im_m.size
 
-                # Compute SSIM at target_width
                 src_w, src_h = im_m.size
                 target_w = min(args.target_width, src_w)
                 target_h = round(src_h * (target_w / max(src_w, 1)))
-                ssim_mask = ssim_diff_mask(
-                    im_m, im_v, args.ssim_threshold, target_w)
-                dino_mask = dino_diff_mask(
-                    feat, im_m, im_v, args.dino_threshold,
-                    (target_h, target_w))
+
+                # SSIM is skipped in dino_only mode; DINOv2 is skipped in
+                # ssim_only mode. Saves the slower of the two when we know
+                # the other carries the signal.
+                ssim_mask = (
+                    ssim_diff_mask(im_m, im_v, args.ssim_threshold, target_w)
+                    if args.combine != "dino_only"
+                    else np.zeros((target_h, target_w), dtype=bool)
+                )
+                dino_mask = (
+                    dino_diff_mask(feat, im_m, im_v, args.dino_threshold,
+                                   (target_h, target_w))
+                    if args.combine != "ssim_only"
+                    else np.zeros((target_h, target_w), dtype=bool)
+                )
 
                 if args.combine == "and":
                     combined = ssim_mask & dino_mask
-                else:
+                elif args.combine == "or":
                     combined = ssim_mask | dino_mask
+                elif args.combine == "dino_only":
+                    combined = dino_mask
+                else:  # ssim_only
+                    combined = ssim_mask
 
                 if open_se is not None:
                     combined = binary_opening(combined, open_se)
@@ -301,6 +326,19 @@ def main() -> int:
                 if args.min_area > 0:
                     combined = remove_small_objects(combined,
                                                     min_size=args.min_area)
+                if args.keep_largest > 0:
+                    labels, n = ndimage.label(combined)
+                    if n > args.keep_largest:
+                        sizes = ndimage.sum(combined, labels,
+                                            range(1, n + 1))
+                        # Keep the largest N component ids (1-indexed)
+                        keep_ids = set(
+                            int(i + 1) for i in np.argsort(sizes)[-args.keep_largest:]
+                        )
+                        keep = np.zeros_like(combined)
+                        for cid in keep_ids:
+                            keep[labels == cid] = True
+                        combined = keep
 
                 # Upsample mask to original resolution
                 mask_img = Image.fromarray(
