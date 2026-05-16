@@ -125,8 +125,8 @@ def get_candidates(*, condition: str, model_version: str,
     return resp.get("items") or []
 
 
-def get_truth_pairs(condition: str) -> list[dict]:
-    sp = urllib.parse.urlencode({"condition": condition})
+def get_truth_pairs(condition: str, decision: str = "edited") -> list[dict]:
+    sp = urllib.parse.urlencode({"condition": condition, "decision": decision})
     return _request("GET",
                     f"/api/internal/ground-truth-masks?{sp}")["items"]
 
@@ -208,6 +208,13 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=500,
                     help="candidate cap (we predict on every candidate, "
                          "including train+eval, so set this high enough)")
+    ap.add_argument("--include-rejected-negatives", action="store_true",
+                    default=True,
+                    help="also use Annotation rows with decision='rejected' "
+                         "(condition not present anywhere in the image) as "
+                         "full-image negatives in the bank. Default on.")
+    ap.add_argument("--no-rejected-negatives", dest="include_rejected_negatives",
+                    action="store_false")
     ap.add_argument("--tag", default=None,
                     help="suffix appended to modelVersion (default = "
                          "'h{heldout}_t{threshold}'); makes each run its own "
@@ -273,6 +280,35 @@ def main() -> int:
     if not pos_chunks:
         log("ERROR: no positive features collected — bank empty")
         return 2
+
+    # Augment the negative bank with full-image features from images the
+    # labeler said do NOT contain the condition. These are stronger negatives
+    # than "patches outside the mask in a positive image" — a positive image
+    # of a reflection still contains plenty of reflective surfaces that
+    # aren't the photographer, and those patches end up in the within-image
+    # negatives. Rejected images have none of the condition by definition.
+    if args.include_rejected_negatives:
+        log("\n  augmenting negative bank with rejected (no-condition) images ...")
+        rejected = get_truth_pairs(args.condition, decision="rejected")
+        log(f"    rejected rows: {len(rejected)}")
+        with tempfile.TemporaryDirectory(prefix="arem-fewshot-neg-") as scratch:
+            sp = Path(scratch)
+            for i, r in enumerate(rejected, start=1):
+                img_local = sp / f"img-{i:03d}.jpg"
+                if not fetch_image_from_r2(r["imageR2Path"], img_local,
+                                           bucket=R2_OUTPUT_BUCKET):
+                    continue
+                try:
+                    with Image.open(img_local) as im:
+                        feats = feat.features(im)
+                    flat = feats.view(-1, feats.shape[-1])
+                    neg_chunks.append(flat)
+                    log(f"    [{i}/{len(rejected)}] "
+                        f"{r['imageR2Path'].rsplit('/', 1)[-1]}: "
+                        f"+{flat.shape[0]} negs")
+                except Exception as e:
+                    log(f"    WARN reject {r['imageR2Path']}: {e}")
+
     pos_bank = torch.cat(pos_chunks, dim=0)
     neg_bank = torch.cat(neg_chunks, dim=0)
     log(f"\n  bank: pos={pos_bank.shape[0]}  neg={neg_bank.shape[0]}  "
