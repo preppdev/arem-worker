@@ -140,6 +140,20 @@ def get_candidates(condition: str, limit: int) -> list[dict]:
     return items[:limit]
 
 
+def get_done(condition: str, model_run: str) -> set[str]:
+    """Set of imageR2Paths already processed for this (condition, modelRun).
+    Used to make the script resumable / cheap to re-invoke."""
+    sp = urllib.parse.urlencode({"condition": condition})
+    try:
+        resp = _request("GET", f"/api/inpaint-tests?{sp}")
+        for run in resp.get("runs") or []:
+            if run["modelRun"] == model_run:
+                return {it["imageR2Path"] for it in run["items"]}
+    except Exception as e:
+        log(f"  WARN get_done: {e}")
+    return set()
+
+
 # ---- Image-edit providers ----
 
 def edit_replicate(model: str, image_path: Path, prompt: str) -> str:
@@ -229,6 +243,15 @@ def main() -> int:
     if not items:
         log("  no candidates"); return 0
 
+    done = get_done(args.condition, run_id)
+    if done:
+        before = len(items)
+        items = [it for it in items if it["imageR2Path"] not in done]
+        log(f"  skipping {before - len(items)} already-done; "
+            f"{len(items)} to process")
+    if not items:
+        log("  nothing left to process"); return 0
+
     n_done = n_err = 0
     t_start = time.time()
     public_urls: list[str] = []
@@ -270,6 +293,23 @@ def main() -> int:
                 comp_url = f"{DASHBOARD_URL}/api/image?path={urllib.parse.quote(comp_key)}"
                 public_urls.append(comp_url)
                 runtime_ms = int((time.time() - t0) * 1000)
+                # Record on the dashboard so /inpaint-tests/<condition> renders it.
+                try:
+                    _request("POST", "/api/internal/inpaint-test", {
+                        "condition": args.condition,
+                        "modelRun": run_id,
+                        "imageR2Path": src_key,
+                        "vendorR2Path": vendor_key,
+                        "editedR2Path": edit_key,
+                        "compositeR2Path": comp_key,
+                        "prompt": prompt,
+                        "modelInfo": f"{args.model} via {args.provider}",
+                        "multiConditions": [c for c in (it.get("allConditions") or [])
+                                            if c != args.condition],
+                        "runtimeMs": runtime_ms,
+                    })
+                except Exception as e:
+                    log(f"    WARN dashboard POST: {e}")
                 log(f"  [{idx}/{len(items)}] {stem}: api={api_ms}ms "
                     f"total={runtime_ms}ms")
                 log(f"      composite: {comp_url}")
