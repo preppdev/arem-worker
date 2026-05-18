@@ -187,20 +187,21 @@ def main():
     # 3. Pull rows from DB.
     conn = psycopg2.connect(os.environ["DATABASE_URL"])
     cur = conn.cursor()
+    # Process all rows with a CF image, EXCEPT user-labeled ones (verifiedBy set).
+    # This deliberately overwrites any prior auto-label (Haiku etc) with the
+    # local classifier output, which is more accurate at 99.2%.
     if args.all:
         cur.execute("""
             SELECT id, "cfImageId" FROM "ImageReview"
             WHERE "cfImageId" IS NOT NULL
-              AND "exteriorSubType" IS NULL
-              AND "isInteriorCorrected" IS NULL
+              AND "verifiedBy" IS NULL
             ORDER BY "createdAt" DESC
         """)
     else:
         cur.execute("""
             SELECT id, "cfImageId" FROM "ImageReview"
             WHERE "cfImageId" IS NOT NULL
-              AND "exteriorSubType" IS NULL
-              AND "isInteriorCorrected" IS NULL
+              AND "verifiedBy" IS NULL
             ORDER BY "createdAt" DESC
             LIMIT %s
         """, (args.limit,))
