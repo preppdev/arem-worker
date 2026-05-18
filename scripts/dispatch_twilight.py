@@ -39,10 +39,25 @@ def log(s: str) -> None:
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {s}", flush=True)
 
 
+DEFAULT_PROMPT = """Transform this daytime exterior real-estate photo into a professional DAY-TO-DUSK photograph showing the SAME EXACT BUILDING AND SCENERY at sunset.
+
+CRITICAL — BUILDING IDENTITY: This is the EXACT building from the source photo. Do NOT generate a different house. Do NOT change the architecture, roofline, story count, window arrangement, door placement, materials, siding color, masonry, or any structural element. Do NOT modify the landscape or scenery. The output must show the IDENTICAL building and IDENTICAL scenery from the IDENTICAL camera angle and framing — only the sky, lighting, and time-of-day cues change.
+
+SKY: Warm coral-orange sunset. Deep navy at top, transitioning through purple-mauve to vivid coral and bright orange near the horizon. Pale orange dominates the lower half with bright golden-orange highlights right at the horizon line. Warm-dominant and orange-leaning. Soft layered horizontal streaks, not puffy cumulus clouds.
+
+LIGHTING — SUBTLE dusk only: The scene transitions to dusk light levels through a modest reduction in overall brightness and slightly lifted shadows. The foreground (lawn, driveway, siding, masonry, walkway) RETAINS its natural color balance — apply only a LIGHT, GENTLE warm tint, NOT a heavy orange wash. Grass must still read as green. White siding must still read as white. Pavement must still read as gray. Every visible light fixture (interior windows, porch lights, sconces) emits warm golden glow.
+
+WINDOW CONTENTS: For every window, ONLY re-color and re-light what is already visible in the source. DO NOT invent new curtains, furniture, lamps, plants, or decor.
+
+DO NOT ADD ANYTHING: No new lamp posts, garden lights, vehicles, signs, plants, or architectural elements. Only allowed changes: sky, existing light fixtures' glow, warm window glow, and a subtle natural dusk tone on existing elements.
+
+Preserve the exact building, framing, perspective, camera angle, composition, and every existing object's identity."""
+
+
 def load_settings(conn) -> dict:
     """Read twilight.* settings from AppSetting; falls back to baked defaults."""
     defaults = {
-        "twilight.prompt": "",  # never empty in practice
+        "twilight.prompt": DEFAULT_PROMPT,
         "twilight.model": "gemini-3-pro-image-preview",
         "twilight.fallbackModel": "gemini-2.5-flash-image",
         "twilight.aspectRatio": "Auto",
