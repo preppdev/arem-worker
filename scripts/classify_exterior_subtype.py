@@ -166,8 +166,7 @@ def main():
     log(f"loading classifier from {CLASSIFIER_PATH}")
     if not CLASSIFIER_PATH.exists():
         sys.exit(f"missing {CLASSIFIER_PATH}")
-    classifier_tuple = load_classifier(CLASSIFIER_PATH, device)
-    clf, label_names, tfm, _ = classifier_tuple
+    clf, label_names, tfm = load_classifier(CLASSIFIER_PATH, device)
 
     # 2. Optional: room classifier for interior subtype.
     room_model = None
