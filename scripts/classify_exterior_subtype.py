@@ -319,7 +319,7 @@ def main():
                 f"\"roomConfidenceWorker\"=%s, "
                 f"\"isInteriorCorrected\"=NULL, \"exteriorSubType\"=NULL, "
                 f"\"classifiedAt\"=NOW(), \"classifierModelVersions\"=({SAFE_MERGE}) "
-                f"WHERE id=%s AND \"exteriorSubType\" IS NULL AND \"isInteriorCorrected\" IS NULL",
+                f"WHERE id=%s AND \"verifiedBy\" IS NULL",
                 (r.get("room"), r.get("room_conf"), r["id"]),
             )
         elif r["verdict"] == "exterior":
@@ -327,7 +327,7 @@ def main():
                 f"UPDATE \"ImageReview\" SET "
                 f"\"isInteriorWorker\"=false, \"exteriorSubType\"=NULL, "
                 f"\"classifiedAt\"=NOW(), \"classifierModelVersions\"=({SAFE_MERGE}) "
-                f"WHERE id=%s AND \"exteriorSubType\" IS NULL AND \"isInteriorCorrected\" IS NULL",
+                f"WHERE id=%s AND \"verifiedBy\" IS NULL",
                 (r["id"],),
             )
         else:  # front, back, ambiguous
@@ -335,7 +335,7 @@ def main():
                 f"UPDATE \"ImageReview\" SET "
                 f"\"isInteriorWorker\"=false, \"exteriorSubType\"=%s, "
                 f"\"classifiedAt\"=NOW(), \"classifierModelVersions\"=({SAFE_MERGE}) "
-                f"WHERE id=%s AND \"exteriorSubType\" IS NULL AND \"isInteriorCorrected\" IS NULL",
+                f"WHERE id=%s AND \"verifiedBy\" IS NULL",
                 (r["verdict"], r["id"]),
             )
         applied += cur.rowcount
