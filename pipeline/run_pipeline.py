@@ -1,7 +1,7 @@
 """End-to-end Stage 1 + Stage 2 inference for one shoot.
 
 RAW (3 ARWs per triplet) → rawpy demosaic → lensfun correction →
-NAFNet Stage 1 (9-ch in, 3-ch out) → ResNet-18 classifier → Restormer
+NAFNet Stage 1 (9-ch in, 3-ch out) → ResNet-18 classifier → NAFNet
 Stage 2 routed (interior or exterior) → JPG.
 
 Adapted from /home/jordan/sam_reflection_tool/run_pipeline_test.py to
@@ -43,7 +43,6 @@ from torchvision import transforms
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 from models.nafnet import NAFNet
-from models.restormer import Restormer
 from lens_correct import lens_correct_bracket, LensExcluded, load_bracket_frame, RAW_EXTENSIONS
 
 import exifread
@@ -471,56 +470,33 @@ def stage1_infer(model, under16, mid16, over16, device) -> np.ndarray:
     return out
 
 
-# -------- Stage 2 (Restormer routed) --------
-
-class RestormerStage2(Restormer):
-    def forward(self, x):
-        residual_input = x
-        inp = self.patch_embed(x)
-        e1 = self.encoder_1(inp)
-        e2 = self.encoder_2(self.down_1(e1))
-        e3 = self.encoder_3(self.down_2(e2))
-        b = self.bottleneck(self.down_3(e3))
-        d3 = self.decoder_3(self.reduce_3(torch.cat([self.up_3(b), e3], dim=1)))
-        d2 = self.decoder_2(self.reduce_2(torch.cat([self.up_2(d3), e2], dim=1)))
-        d1 = self.decoder_1(self.reduce_1(torch.cat([self.up_1(d2), e1], dim=1)))
-        out = self.output(self.refinement(d1))
-        return torch.clamp(residual_input + out, 0, 1)
-
+# -------- Stage 2 (NAFNet routed) --------
 
 def load_stage2(ckpt: Path, device):
-    """Load a Stage 2 checkpoint. Dispatches by `arch` field:
-       - "nafnet": new may26 NAFNet w32 — uses arch hyperparams from ckpt
-       - "restormer" or missing: legacy Restormer dim=48 (default)
+    """Load a NAFNet Stage 2 checkpoint. Arch hyperparams are read from
+    the checkpoint (may26 ckpts carry them inline); we default to the
+    may26 w=32 config when a key is missing.
 
-    NAFNet weights are cast to bf16 in place — the activation memory at 12 MP
-    fp32 single-pass exceeds the 48 GB A40/A6000 budget once Stage 1, classifier,
-    and both Stage 2 models are resident. NAFNet has no MDTA softmax to break
-    under half precision, so bf16 weights + bf16 activations is safe.
+    Weights are cast to bf16 in place — the activation memory at 12 MP
+    fp32 single-pass exceeds the 48 GB A40/A6000 budget once Stage 1, the
+    classifier, and both Stage 2 models are resident. NAFNet has no
+    softmax attention so bf16 weights + bf16 activations are safe.
     """
-    # Load to CPU to avoid temporarily holding the full ckpt (model + EMA + extras)
-    # in GPU memory; only the picked state dict moves to GPU via load_state_dict.
+    # Load to CPU to avoid temporarily holding the full ckpt (model + EMA
+    # + extras) in GPU memory; only the picked state dict moves to GPU
+    # via load_state_dict.
     ck = torch.load(str(ckpt), map_location="cpu", weights_only=False)
-    arch = (ck.get("arch") or "restormer").lower()
 
-    if arch == "nafnet":
-        from models.nafnet import NAFNet
-        model = NAFNet(
-            in_channels=ck.get("in_channels", 3),
-            out_channels=ck.get("out_channels", 3),
-            width=ck.get("width", 32),
-            middle_blk_num=ck.get("middle_blk_num", 12),
-            enc_blk_nums=ck.get("enc_blk_nums", [2, 2, 4, 8]),
-            dec_blk_nums=ck.get("dec_blk_nums", [2, 2, 2, 2]),
-            use_residual=ck.get("use_residual", True),
-            residual_start=ck.get("residual_start", 0),
-        )
-    else:
-        model = RestormerStage2(
-            in_channels=3, out_channels=3,
-            dim=48, num_blocks=[4, 6, 6, 8],
-            num_refinement_blocks=4, use_residual=False,
-        )
+    model = NAFNet(
+        in_channels=ck.get("in_channels", 3),
+        out_channels=ck.get("out_channels", 3),
+        width=ck.get("width", 32),
+        middle_blk_num=ck.get("middle_blk_num", 12),
+        enc_blk_nums=ck.get("enc_blk_nums", [2, 2, 4, 8]),
+        dec_blk_nums=ck.get("dec_blk_nums", [2, 2, 2, 2]),
+        use_residual=ck.get("use_residual", True),
+        residual_start=ck.get("residual_start", 0),
+    )
 
     # Prefer EMA weights if present
     if ck.get("ema_state_dict"):
@@ -532,19 +508,15 @@ def load_stage2(ckpt: Path, device):
     sd = {k: v for k, v in sd.items() if k in model.state_dict()}
     model.load_state_dict(sd, strict=False)
     model.eval()
-    model._arch = arch
 
-    # Free the on-CPU ckpt dict ASAP (incl. any optimizer state in legacy ckpts)
+    # Free the on-CPU ckpt dict ASAP
     del ck, sd
 
-    if arch == "nafnet":
-        model = model.to(device).bfloat16()
-    else:
-        model = model.to(device)
+    model = model.to(device).bfloat16()
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    print(f"  loaded {ckpt.name} arch={arch} dtype={next(model.parameters()).dtype}", flush=True)
+    print(f"  loaded {ckpt.name} (NAFNet) dtype={next(model.parameters()).dtype}", flush=True)
     return model
 
 
@@ -688,20 +660,14 @@ def stage2_infer(model, jpg_path: Path, out_path: Path, device,
     w16 = (w // 16) * 16
     img = img[:h16, :w16]
 
-    arch = getattr(model, "_arch", "restormer")
-    # Single-pass only (no tiling). NAFNet weights + activations run in bf16
-    # (model already cast in load_stage2). Restormer stays fp32 — its MDTA
-    # channel-softmax saturates under half precision and produces an
-    # FFT-confirmed horizontal-stripe periodic texture.
-    # Cap derives from MAX_MP (single-pass only, no tiling). +5% slack accounts
-    # for the 16-pixel alignment rounding pushing dims slightly past the cap.
+    # Single-pass only (no tiling). NAFNet weights + activations run in
+    # bf16 (model already cast in load_stage2). Cap derives from MAX_MP;
+    # +5% slack accounts for 16-pixel alignment rounding pushing dims
+    # slightly past the cap.
     cap_px = int(MAX_MP * 1.05 * 1024 * 1024)
     if h16 * w16 <= cap_px:
         x = torch.from_numpy(img.astype(np.float32)).permute(2, 0, 1).unsqueeze(0) / 255.0
-        if arch == "nafnet":
-            x = x.to(device, dtype=torch.bfloat16)
-        else:
-            x = x.to(device)
+        x = x.to(device, dtype=torch.bfloat16)
         with torch.no_grad():
             y = model(x)
         y = torch.clamp(y.float(), 0, 1)

@@ -35,8 +35,8 @@ logger = logging.getLogger(__name__)
 # File extensions that go through the rawpy + lensfun path. Anything else
 # (JPG/JPEG/TIFF/PNG/JXL/WEBP) goes through decode_standard_image() — no
 # demosaic, no lens correction, just decode + upscale to 16-bit so the
-# rest of the pipeline (NAFNet 9-ch input, Restormer Stage 2) can treat
-# it identically.
+# rest of the pipeline (NAFNet Stage 1 9-ch input, NAFNet Stage 2) can
+# treat it identically.
 RAW_EXTENSIONS = {".arw", ".cr2", ".cr3", ".nef", ".dng", ".raf", ".rw2"}
 
 # Lenses we explicitly exclude from the Stage 1 POC because they have no

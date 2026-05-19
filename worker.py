@@ -1,9 +1,10 @@
 """AREM editing pipeline worker.
 
 Polls the dashboard /api/jobs/claim endpoint for queued shoots, pulls ARWs
-from Dropbox, runs the production pipeline (Photomatix merge → Stage 2
-Restormer → auto-upright + EXIF), uploads the finished JPEGs back to
-Dropbox under /08-Test-Edit, and reports status to the dashboard.
+from Dropbox, runs the production pipeline (rawpy → NAFNet Stage 1 →
+classifier → NAFNet Stage 2 → auto-upright + EXIF), uploads the finished
+JPEGs back to Dropbox under /08-Test-Edit, and reports status to the
+dashboard.
 
 Designed to be runnable both locally (current host) and in a Docker
 container on RunPod. Stateless except for the local scratch dir that
@@ -264,7 +265,7 @@ def download_raws(dropbox_remote_path: str, local_raw_dir: Path) -> tuple[int, i
 
 
 def run_inference(local_raw_dir: Path, pred_root: Path) -> Path:
-    """Run the canonical Stage 1 (NAFNet) + Stage 2 (Restormer routed) pipeline.
+    """Run the canonical Stage 1 (NAFNet) + Stage 2 (NAFNet routed) pipeline.
 
     Calls pipeline/run_pipeline.py via subprocess to keep deps isolated.
     Returns the directory containing the Stage 2 JPGs (named
@@ -614,7 +615,7 @@ def process_job(job: dict) -> dict:
     post_status(job_id, "processing", fileCount=n_arws, totalBytes=total_bytes)
     log(f"    downloaded {n_arws} inputs from {raw_subfolder} ({total_bytes/1e9:.2f} GB)")
 
-    log("  [2/4] inference (rawpy → photomatix → restormer)")
+    log("  [2/4] inference (rawpy → NAFNet stage1 → NAFNet stage2)")
     pred_dir = run_inference(raw_dir, pred_root)
 
     log("  [3/4] auto-upright + EXIF/branding")
