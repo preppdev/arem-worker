@@ -282,9 +282,19 @@ def build_exif_dict(arw_meta: dict, year: int) -> bytes:
 
 
 def upright_one(img_path: Path, out_path: Path,
-                max_rotation_deg: float = 5.0,
+                max_rotation_deg: float = 2.0,
+                min_vert_segs: int = 8,
+                max_residual_std_deg: float = 1.5,
                 arw_root: Path = ARW_ROOT) -> dict:
-    """Process one image: detect, rotate, crop. Returns metrics dict."""
+    """Process one image: detect, rotate, crop. Returns metrics dict.
+
+    Rotation is applied only when ALL of:
+      |estimated| <= max_rotation_deg  (real-estate handheld is rarely >2°)
+      n_vert     >= min_vert_segs      (enough verticals to trust the estimate)
+      residual   <= max_residual_std_deg  (verticals agree with each other)
+
+    Any failure → applied=0 (image kept straight) with `clamp_reason` set.
+    """
     t0 = time.time()
     img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
     if img is None:
@@ -295,7 +305,15 @@ def upright_one(img_path: Path, out_path: Path,
     segs = detect_segments(gray)
     rot_deg, n_vert, residual = estimate_rotation(segs)
 
+    clamp_reason: str | None = None
     if abs(rot_deg) > max_rotation_deg:
+        clamp_reason = "magnitude"
+    elif n_vert < min_vert_segs:
+        clamp_reason = "low_confidence_n_vert"
+    elif residual > max_residual_std_deg:
+        clamp_reason = "low_confidence_residual"
+
+    if clamp_reason is not None:
         applied = 0.0
         clamped = True
     else:
@@ -346,6 +364,7 @@ def upright_one(img_path: Path, out_path: Path,
         "rotation_estimated_deg": round(rot_deg, 3),
         "rotation_applied_deg": round(applied, 3),
         "rotation_clamped": clamped,
+        "clamp_reason": clamp_reason,
         "n_vertical_segs": n_vert,
         "residual_std_deg": round(residual, 3),
         "crop_area_ratio": round(area_ratio, 4),
