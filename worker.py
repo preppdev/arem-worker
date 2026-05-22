@@ -199,11 +199,11 @@ def _get_settings() -> dict:
     inner `settings` map or an empty dict on transport failure (caller
     treats missing keys as "Stage 3 off")."""
     try:
-        r = _get("/api/settings")
+        r = _get("/api/internal/settings")
         return r.get("settings") or {}
     except Exception as e:
-        log(f"  WARN /api/settings fetch failed: {str(e)[:200]} — assuming "
-            f"Stage 3 polish off")
+        log(f"  WARN /api/internal/settings fetch failed: {str(e)[:200]} — "
+            f"assuming Stage 3 polish off")
         return {}
 
 
