@@ -1,8 +1,16 @@
-"""End-to-end Stage 1 + Stage 2 inference for one shoot.
+"""End-to-end Stage 1 + Stage 2 + Stage 3 inference for one shoot.
 
 RAW (3 ARWs per triplet) → rawpy demosaic → lensfun correction →
-NAFNet Stage 1 (9-ch in, 3-ch out) → ResNet-18 classifier → Restormer
-Stage 2 routed (interior or exterior) → JPG.
+NAFNet Stage 1 (9-ch in, 3-ch out) → ResNet-18 classifier → NAFNet
+Stage 2 routed (interior or exterior) → NAFNet Stage 3 polish (routed,
+optional) → JPG.
+
+Stage 3 is a style-application step: a small NAFNet fine-tune that
+nudges Stage-2 output toward a chosen target style. The exterior and
+interior lanes carry independent ckpts; either side can be null, in
+which case Stage 3 is a no-op for that route and the Stage-2 output is
+emitted as the final JPG. The variant id (ckpt-parent dirname) is
+recorded on each ImageReview row via worker.py.
 
 Adapted from /home/jordan/sam_reflection_tool/run_pipeline_test.py to
 process one shoot directory at a time, driven via CLI flags. Used by
@@ -15,6 +23,8 @@ Usage:
         --stage1-ckpt /workspace/checkpoints/stage1_jxl_v1_best_lpips.pth \
         --interior-ckpt /workspace/checkpoints/interior_full_v1_latest.pth \
         --exterior-ckpt /workspace/checkpoints/exterior_full_v1_latest.pth \
+        --polish-exterior-ckpt /workspace/checkpoints/polish_exterior_v1.pth \
+        --polish-interior-ckpt /workspace/checkpoints/polish_interior_v1.pth \
         --classifier /workspace/pipeline/classifier_v2.pth
 """
 from __future__ import annotations
@@ -43,7 +53,6 @@ from torchvision import transforms
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 from models.nafnet import NAFNet
-from models.restormer import Restormer
 from lens_correct import lens_correct_bracket, LensExcluded, load_bracket_frame, RAW_EXTENSIONS
 
 import exifread
@@ -471,56 +480,33 @@ def stage1_infer(model, under16, mid16, over16, device) -> np.ndarray:
     return out
 
 
-# -------- Stage 2 (Restormer routed) --------
-
-class RestormerStage2(Restormer):
-    def forward(self, x):
-        residual_input = x
-        inp = self.patch_embed(x)
-        e1 = self.encoder_1(inp)
-        e2 = self.encoder_2(self.down_1(e1))
-        e3 = self.encoder_3(self.down_2(e2))
-        b = self.bottleneck(self.down_3(e3))
-        d3 = self.decoder_3(self.reduce_3(torch.cat([self.up_3(b), e3], dim=1)))
-        d2 = self.decoder_2(self.reduce_2(torch.cat([self.up_2(d3), e2], dim=1)))
-        d1 = self.decoder_1(self.reduce_1(torch.cat([self.up_1(d2), e1], dim=1)))
-        out = self.output(self.refinement(d1))
-        return torch.clamp(residual_input + out, 0, 1)
-
+# -------- Stage 2 (NAFNet routed) --------
 
 def load_stage2(ckpt: Path, device):
-    """Load a Stage 2 checkpoint. Dispatches by `arch` field:
-       - "nafnet": new may26 NAFNet w32 — uses arch hyperparams from ckpt
-       - "restormer" or missing: legacy Restormer dim=48 (default)
+    """Load a NAFNet Stage 2 checkpoint. Arch hyperparams are read from
+    the checkpoint (may26 ckpts carry them inline); we default to the
+    may26 w=32 config when a key is missing.
 
-    NAFNet weights are cast to bf16 in place — the activation memory at 12 MP
-    fp32 single-pass exceeds the 48 GB A40/A6000 budget once Stage 1, classifier,
-    and both Stage 2 models are resident. NAFNet has no MDTA softmax to break
-    under half precision, so bf16 weights + bf16 activations is safe.
+    Weights are cast to bf16 in place — the activation memory at 12 MP
+    fp32 single-pass exceeds the 48 GB A40/A6000 budget once Stage 1, the
+    classifier, and both Stage 2 models are resident. NAFNet has no
+    softmax attention so bf16 weights + bf16 activations are safe.
     """
-    # Load to CPU to avoid temporarily holding the full ckpt (model + EMA + extras)
-    # in GPU memory; only the picked state dict moves to GPU via load_state_dict.
+    # Load to CPU to avoid temporarily holding the full ckpt (model + EMA
+    # + extras) in GPU memory; only the picked state dict moves to GPU
+    # via load_state_dict.
     ck = torch.load(str(ckpt), map_location="cpu", weights_only=False)
-    arch = (ck.get("arch") or "restormer").lower()
 
-    if arch == "nafnet":
-        from models.nafnet import NAFNet
-        model = NAFNet(
-            in_channels=ck.get("in_channels", 3),
-            out_channels=ck.get("out_channels", 3),
-            width=ck.get("width", 32),
-            middle_blk_num=ck.get("middle_blk_num", 12),
-            enc_blk_nums=ck.get("enc_blk_nums", [2, 2, 4, 8]),
-            dec_blk_nums=ck.get("dec_blk_nums", [2, 2, 2, 2]),
-            use_residual=ck.get("use_residual", True),
-            residual_start=ck.get("residual_start", 0),
-        )
-    else:
-        model = RestormerStage2(
-            in_channels=3, out_channels=3,
-            dim=48, num_blocks=[4, 6, 6, 8],
-            num_refinement_blocks=4, use_residual=False,
-        )
+    model = NAFNet(
+        in_channels=ck.get("in_channels", 3),
+        out_channels=ck.get("out_channels", 3),
+        width=ck.get("width", 32),
+        middle_blk_num=ck.get("middle_blk_num", 12),
+        enc_blk_nums=ck.get("enc_blk_nums", [2, 2, 4, 8]),
+        dec_blk_nums=ck.get("dec_blk_nums", [2, 2, 2, 2]),
+        use_residual=ck.get("use_residual", True),
+        residual_start=ck.get("residual_start", 0),
+    )
 
     # Prefer EMA weights if present
     if ck.get("ema_state_dict"):
@@ -532,19 +518,15 @@ def load_stage2(ckpt: Path, device):
     sd = {k: v for k, v in sd.items() if k in model.state_dict()}
     model.load_state_dict(sd, strict=False)
     model.eval()
-    model._arch = arch
 
-    # Free the on-CPU ckpt dict ASAP (incl. any optimizer state in legacy ckpts)
+    # Free the on-CPU ckpt dict ASAP
     del ck, sd
 
-    if arch == "nafnet":
-        model = model.to(device).bfloat16()
-    else:
-        model = model.to(device)
+    model = model.to(device).bfloat16()
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    print(f"  loaded {ckpt.name} arch={arch} dtype={next(model.parameters()).dtype}", flush=True)
+    print(f"  loaded {ckpt.name} (NAFNet) dtype={next(model.parameters()).dtype}", flush=True)
     return model
 
 
@@ -679,6 +661,30 @@ def embed_classification_exif(jpg_path: Path, payload: dict) -> bool:
         return False
 
 
+def load_stage3(ckpt: Path, device):
+    """Load a NAFNet Stage 3 (polish) checkpoint.
+
+    Identical loading semantics to `load_stage2` — Stage 3 is the same
+    arch (NAFNet w=32 by default), just fine-tuned on a different
+    objective (pipeline-output → vendor/Lightroom-style target). Kept as
+    a separate symbol so call sites stay self-documenting; thin wrapper
+    over load_stage2 so we don't drift if the loader changes.
+    """
+    return load_stage2(ckpt, device)
+
+
+def stage3_infer(model, jpg_path: Path, out_path: Path, device,
+                 quality=92) -> tuple[int, int]:
+    """Apply Stage 3 polish to a Stage-2 JPG.
+
+    Same single-pass logic as stage2_infer — operates on a JPG read from
+    disk, dimensions snapped to multiple of 16, bf16 inference, single
+    pass under MAX_MP. Stage-2 output already obeys MAX_MP so there's
+    no additional resize needed.
+    """
+    return stage2_infer(model, jpg_path, out_path, device, quality=quality)
+
+
 def stage2_infer(model, jpg_path: Path, out_path: Path, device,
                  tile=1024, overlap=64, quality=92) -> tuple[int, int]:
     img = cv2.imread(str(jpg_path), cv2.IMREAD_COLOR)
@@ -688,20 +694,14 @@ def stage2_infer(model, jpg_path: Path, out_path: Path, device,
     w16 = (w // 16) * 16
     img = img[:h16, :w16]
 
-    arch = getattr(model, "_arch", "restormer")
-    # Single-pass only (no tiling). NAFNet weights + activations run in bf16
-    # (model already cast in load_stage2). Restormer stays fp32 — its MDTA
-    # channel-softmax saturates under half precision and produces an
-    # FFT-confirmed horizontal-stripe periodic texture.
-    # Cap derives from MAX_MP (single-pass only, no tiling). +5% slack accounts
-    # for the 16-pixel alignment rounding pushing dims slightly past the cap.
+    # Single-pass only (no tiling). NAFNet weights + activations run in
+    # bf16 (model already cast in load_stage2). Cap derives from MAX_MP;
+    # +5% slack accounts for 16-pixel alignment rounding pushing dims
+    # slightly past the cap.
     cap_px = int(MAX_MP * 1.05 * 1024 * 1024)
     if h16 * w16 <= cap_px:
         x = torch.from_numpy(img.astype(np.float32)).permute(2, 0, 1).unsqueeze(0) / 255.0
-        if arch == "nafnet":
-            x = x.to(device, dtype=torch.bfloat16)
-        else:
-            x = x.to(device)
+        x = x.to(device, dtype=torch.bfloat16)
         with torch.no_grad():
             y = model(x)
         y = torch.clamp(y.float(), 0, 1)
@@ -722,7 +722,9 @@ def stage2_infer(model, jpg_path: Path, out_path: Path, device,
 
 def process_shoot(raw_dir: Path, out_dir: Path,
                   stage1_ckpt: Path, int_ckpt: Path, ext_ckpt: Path,
-                  clf_ckpt: Path) -> dict:
+                  clf_ckpt: Path,
+                  polish_int_ckpt: Path | None = None,
+                  polish_ext_ckpt: Path | None = None) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     s1_dir = out_dir / "stage1"
     s2_dir = out_dir / "stage2"
@@ -736,6 +738,17 @@ def process_shoot(raw_dir: Path, out_dir: Path,
     s1 = load_stage1(stage1_ckpt, device)
     s2_int = load_stage2(int_ckpt, device)
     s2_ext = load_stage2(ext_ckpt, device)
+    # Stage 3 polish (optional, per-route). A missing ckpt for a lane
+    # means Stage 3 is a no-op for that route — the Stage-2 output is
+    # the final image. variant ids are the ckpt parent dirname, e.g.
+    # "polish_exterior_v1", and surface on ImageReview.stage3Variant.
+    s3_int = load_stage3(polish_int_ckpt, device) if polish_int_ckpt else None
+    s3_ext = load_stage3(polish_ext_ckpt, device) if polish_ext_ckpt else None
+    s3_int_variant = polish_int_ckpt.parent.name if polish_int_ckpt else None
+    s3_ext_variant = polish_ext_ckpt.parent.name if polish_ext_ckpt else None
+    if s3_int or s3_ext:
+        print(f"  Stage 3 polish: ext={s3_ext_variant or 'off'} "
+              f"int={s3_int_variant or 'off'}", flush=True)
     clf, label_names, clf_tfm = load_classifier(clf_ckpt, device)
     # Optional — gated by env CLASSIFIER_ROOM. If unset/missing the
     # worker just emits isInteriorWorker without roomTypeWorker.
@@ -815,6 +828,35 @@ def process_shoot(raw_dir: Path, out_dir: Path,
             continue
         t_s2 = time.time()
 
+        # ── Stage 3 (polish) ─────────────────────────────────────────────
+        # Apply the routed polish model if one is configured. Writes a
+        # NEW file (<stem>_stage3-<route>.jpg) and then renames over the
+        # Stage 2 file — downstream (auto_upright, worker rclone upload)
+        # reads from s2_dir/<stem>_stage2-<route>.jpg, so the final
+        # image is always at the same path regardless of whether Stage
+        # 3 ran. stage3Variant is recorded in cls_payload below so the
+        # dashboard tracks which polish was actually applied.
+        s3_model = s3_int if is_int else s3_ext
+        s3_variant = s3_int_variant if is_int else s3_ext_variant
+        applied_stage3_variant: str | None = None
+        if s3_model is not None:
+            s3_path = s2_dir / f"{stem}_stage3-{route}.jpg"
+            try:
+                stage3_infer(s3_model, s2_path, s3_path, device)
+                # Overwrite the Stage 2 file in place so the downstream
+                # auto_upright / Dropbox upload paths don't change.
+                s3_path.replace(s2_path)
+                applied_stage3_variant = s3_variant
+            except Exception as e:
+                # Stage 3 failure should NOT fail the image — we still
+                # have a perfectly good Stage 2 output. Log and continue
+                # with Stage 2 as the final.
+                print(f"  [{ti}/{len(triplets)}] {stem}: stage3 fail (continuing "
+                      f"with stage2 output): {e}", flush=True)
+                traceback.print_exc()
+                s3_path.unlink(missing_ok=True)
+        t_s3 = time.time()
+
         if is_int: n_int += 1
         else: n_ext += 1
 
@@ -834,9 +876,17 @@ def process_shoot(raw_dir: Path, out_dir: Path,
             "roomType": (room or {}).get("roomType"),
             "roomConfidence": round((room or {}).get("roomConfidence") or 0.0, 4) if room else None,
             "occupancy": (room or {}).get("occupancy"),
+            # stage3Variant: the dirname of the polish ckpt applied to
+            # this image, e.g. "polish_exterior_v1". Null when no polish
+            # ckpt was configured for this image's route OR Stage 3 ran
+            # but errored (we keep the Stage 2 output and don't claim a
+            # polish was applied).
+            "stage3Variant": applied_stage3_variant,
             "modelVersions": {
                 "stage1": stage1_ckpt.name,
                 "stage2": (int_ckpt if is_int else ext_ckpt).name,
+                "stage3": (polish_int_ckpt.name if is_int else polish_ext_ckpt.name)
+                           if applied_stage3_variant else None,
                 "interior_classifier": clf_ckpt.name,
                 "room_classifier": (room or {}).get("version"),
             },
@@ -874,13 +924,15 @@ def process_shoot(raw_dir: Path, out_dir: Path,
                 "s1": round(t_s1 - t_demos, 2),
                 "clf": round(t_clf - t_s1, 2),
                 "s2": round(t_s2 - t_clf, 2),
-                "room": round(t_room - t_s2, 2),
+                "s3": round(t_s3 - t_s2, 2),
+                "room": round(t_room - t_s3, 2),
                 "total": round(t_room - t0, 2),
             },
         })
+        s3_log = f" s3={t_s3-t_s2:.1f}s" if applied_stage3_variant else ""
         print(f"  [{ti}/{len(triplets)}] {stem} {route} ({conf:.2f}) "
               f"demos={t_demos-t0:.1f}s s1={t_s1-t_demos:.1f}s "
-              f"s2={t_s2-t_clf:.1f}s tot={t_s2-t0:.1f}s",
+              f"s2={t_s2-t_clf:.1f}s{s3_log} tot={t_s3-t0:.1f}s",
               flush=True)
 
     meta["wall_min"] = round((time.time() - grand_t0) / 60, 1)
@@ -913,14 +965,36 @@ def main():
     ap.add_argument("--exterior-ckpt", type=Path,
                      default=Path(os.environ.get("CHECKPOINT_EXTERIOR",
                                                   "/workspace/checkpoints/exterior_full_v1_latest.pth")))
+    # Stage 3 polish ckpts. Optional per-route — empty string disables
+    # Stage 3 for that lane. Env vars CHECKPOINT_POLISH_INTERIOR /
+    # CHECKPOINT_POLISH_EXTERIOR provide the worker default; the worker
+    # resolves them from AppSetting `polish.ckpts` keyed by Job.polishStyle.
+    def _opt_path(s: str | None) -> Path | None:
+        return Path(s) if s else None
+    ap.add_argument("--polish-interior-ckpt", type=_opt_path, default=None,
+                     help="Optional Stage 3 polish ckpt for interior route; "
+                          "omit or pass empty string to skip Stage 3 for interior.")
+    ap.add_argument("--polish-exterior-ckpt", type=_opt_path, default=None,
+                     help="Optional Stage 3 polish ckpt for exterior route; "
+                          "omit or pass empty string to skip Stage 3 for exterior.")
     ap.add_argument("--classifier", type=Path,
                      default=Path(os.environ.get("CLASSIFIER_PATH",
                                                   "/workspace/pipeline/classifier_v2.pth")))
     args = ap.parse_args()
 
+    # Env fallbacks for polish ckpts — used when worker.py passes via env
+    # rather than via flags. Worker prefers flags but env is the legacy
+    # fallback for ad-hoc CLI runs.
+    polish_int = args.polish_interior_ckpt or _opt_path(
+        os.environ.get("CHECKPOINT_POLISH_INTERIOR") or None)
+    polish_ext = args.polish_exterior_ckpt or _opt_path(
+        os.environ.get("CHECKPOINT_POLISH_EXTERIOR") or None)
+
     process_shoot(args.raw_dir, args.output_dir,
                   args.stage1_ckpt, args.interior_ckpt, args.exterior_ckpt,
-                  args.classifier)
+                  args.classifier,
+                  polish_int_ckpt=polish_int,
+                  polish_ext_ckpt=polish_ext)
 
 
 if __name__ == "__main__":

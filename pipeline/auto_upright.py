@@ -165,15 +165,22 @@ def rotate_and_crop(img: np.ndarray, angle_deg: float) -> tuple[np.ndarray, floa
     sin_a = math.sin(a)
     cos_a = math.cos(a)
     if side_short <= 2 * sin_a * cos_a * side_long:
+        # "Thin" case: formula uses side_short/side_long (asymmetric in
+        # w/h), so a portrait image needs the result transposed back.
         x = 0.5 * side_short
         wc = x / sin_a
         hc = x / cos_a
+        if w < h:
+            wc, hc = hc, wc
     else:
+        # "Fat" case (common small-angle path): the formula is symmetric
+        # in w and h — swapping w↔h gives wc↔hc, which is exactly the
+        # transpose we want for portrait. NO additional swap.
+        # (Previously had an unconditional swap below, which broke
+        # portrait images by squaring their crop.)
         denom = cos_a * cos_a - sin_a * sin_a
         wc = (w * cos_a - h * sin_a) / denom
         hc = (h * cos_a - w * sin_a) / denom
-    if w < h:
-        wc, hc = hc, wc
     wc = max(int(wc), 1)
     hc = max(int(hc), 1)
     cx, cy = w // 2, h // 2

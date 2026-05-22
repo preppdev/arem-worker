@@ -1,9 +1,10 @@
 """AREM editing pipeline worker.
 
 Polls the dashboard /api/jobs/claim endpoint for queued shoots, pulls ARWs
-from Dropbox, runs the production pipeline (Photomatix merge → Stage 2
-Restormer → auto-upright + EXIF), uploads the finished JPEGs back to
-Dropbox under /08-Test-Edit, and reports status to the dashboard.
+from Dropbox, runs the production pipeline (rawpy → NAFNet Stage 1 →
+classifier → NAFNet Stage 2 → auto-upright + EXIF), uploads the finished
+JPEGs back to Dropbox under /08-Test-Edit, and reports status to the
+dashboard.
 
 Designed to be runnable both locally (current host) and in a Docker
 container on RunPod. Stateless except for the local scratch dir that
@@ -101,6 +102,13 @@ CHECKPOINT_EXTERIOR = Path(os.environ.get("CHECKPOINT_EXTERIOR",
     str(Path.home() / "checkpoints_remote/exterior_full_v1_latest.pth")))
 CLASSIFIER_PATH = Path(os.environ.get("CLASSIFIER_PATH",
     str(AREM_REPO / "classifier_v2.pth")))
+# Local cache for Stage 3 polish checkpoints fetched on-demand from R2.
+# Keyed by R2 key (full path under arem-training-data) to ensure
+# different ckpts coexist. Wiped only when the box restarts; we never
+# evict — total footprint stays small (one ~250-450 MB ckpt per style).
+POLISH_CACHE_ROOT = Path(os.environ.get("POLISH_CACHE_ROOT",
+    str(Path.home() / "polish-cache")))
+POLISH_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
 PYTHON_BIN = os.environ.get("PYTHON_BIN", sys.executable)
 
 
@@ -185,6 +193,82 @@ def _http_put(url: str, src: Path) -> None:
             raise RuntimeError(f"PUT {url[:80]}... -> HTTP {e.code}: {body_text[:300]}")
 
 
+# ---- Stage 3 polish ckpt resolution ----
+def _get_settings() -> dict:
+    """Fetch the merged AppSetting JSON from the dashboard. Returns the
+    inner `settings` map or an empty dict on transport failure (caller
+    treats missing keys as "Stage 3 off")."""
+    try:
+        r = _get("/api/settings")
+        return r.get("settings") or {}
+    except Exception as e:
+        log(f"  WARN /api/settings fetch failed: {str(e)[:200]} — assuming "
+            f"Stage 3 polish off")
+        return {}
+
+
+def _ensure_polish_ckpt(r2_key: str) -> Path | None:
+    """Download a polish checkpoint from R2 into POLISH_CACHE_ROOT if
+    missing locally, return the local path. Returns None if the
+    download fails (caller skips Stage 3 for that route).
+    """
+    # Cache layout mirrors the R2 key so different ckpts coexist and the
+    # parent dir name (used as stage3Variant) is preserved.
+    local = POLISH_CACHE_ROOT / r2_key
+    if local.is_file() and local.stat().st_size > 0:
+        return local
+    local.parent.mkdir(parents=True, exist_ok=True)
+    src = f"r2:arem-training-data/{r2_key}"
+    log(f"  Stage 3: fetching {src} → {local}")
+    try:
+        r = subprocess.run(
+            ["rclone", "copyto", src, str(local), "--s3-no-check-bucket"],
+            capture_output=True, text=True, timeout=600,
+        )
+        if r.returncode != 0:
+            log(f"  WARN polish ckpt rclone rc={r.returncode}: "
+                f"{r.stderr[-200:]}")
+            return None
+        if not local.is_file() or local.stat().st_size == 0:
+            log(f"  WARN polish ckpt empty after fetch: {local}")
+            return None
+        return local
+    except Exception as e:
+        log(f"  WARN polish ckpt fetch failed: {str(e)[:200]}")
+        return None
+
+
+def resolve_polish_ckpts(style: str | None) -> dict[str, Path | None]:
+    """Resolve Stage 3 polish checkpoints for the given style.
+
+    Looks up AppSetting `polish.ckpts` (a JSON map of
+    styleName -> {exterior, interior}), falling back to
+    `polish.defaultStyle` when `style` is null. Downloads each referenced
+    R2 key to POLISH_CACHE_ROOT on first use. Returns
+    {"interior": Path|None, "exterior": Path|None} — a None value means
+    "skip Stage 3 for this route".
+    """
+    settings = _get_settings()
+    ckpts = settings.get("polish.ckpts") or {}
+    default_style = settings.get("polish.defaultStyle") or "default"
+    effective_style = style or default_style
+    entry = ckpts.get(effective_style) or ckpts.get(default_style) or {}
+    out: dict[str, Path | None] = {"interior": None, "exterior": None}
+    for route in ("interior", "exterior"):
+        key = entry.get(route)
+        if not key:
+            continue
+        path = _ensure_polish_ckpt(key)
+        out[route] = path
+    if out["interior"] or out["exterior"]:
+        log(f"  Stage 3 style='{effective_style}' resolved: "
+            f"ext={out['exterior'].name if out['exterior'] else 'off'} "
+            f"int={out['interior'].name if out['interior'] else 'off'}")
+    else:
+        log(f"  Stage 3 style='{effective_style}': no ckpts (Stage 3 disabled)")
+    return out
+
+
 # ---- Dropbox path resolution ----
 def resolve_dropbox_source(stored_path: str) -> str:
     """Translate the stored dropboxPath into an rclone remote path.
@@ -263,12 +347,17 @@ def download_raws(dropbox_remote_path: str, local_raw_dir: Path) -> tuple[int, i
     return len(files), total, RAW_SUBFOLDER
 
 
-def run_inference(local_raw_dir: Path, pred_root: Path) -> Path:
-    """Run the canonical Stage 1 (NAFNet) + Stage 2 (Restormer routed) pipeline.
+def run_inference(local_raw_dir: Path, pred_root: Path,
+                  polish_ckpts: dict[str, Path | None] | None = None) -> Path:
+    """Run the canonical Stage 1 (NAFNet) + Stage 2 (NAFNet routed) +
+    Stage 3 (NAFNet polish, optional) pipeline.
 
     Calls pipeline/run_pipeline.py via subprocess to keep deps isolated.
-    Returns the directory containing the Stage 2 JPGs (named
-    <stem>_stage2-{int|ext}.jpg).
+    `polish_ckpts` is the resolved {"interior", "exterior"} dict from
+    resolve_polish_ckpts(); None values disable Stage 3 for that route.
+    Returns the directory containing the final JPGs (still named
+    <stem>_stage2-{int|ext}.jpg — Stage 3 overwrites Stage 2 in place
+    so downstream paths don't change).
     """
     pred_root.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -276,6 +365,14 @@ def run_inference(local_raw_dir: Path, pred_root: Path) -> Path:
         "--raw-dir", str(local_raw_dir),
         "--output-dir", str(pred_root),
     ]
+    # Stage 3 polish ckpts — pass via flags so the subprocess doesn't
+    # also need to talk to the dashboard. Omitting a flag = no polish on
+    # that route.
+    if polish_ckpts:
+        if polish_ckpts.get("interior"):
+            cmd += ["--polish-interior-ckpt", str(polish_ckpts["interior"])]
+        if polish_ckpts.get("exterior"):
+            cmd += ["--polish-exterior-ckpt", str(polish_ckpts["exterior"])]
     # CHECKPOINT_STAGE1 / CHECKPOINT_INTERIOR / CHECKPOINT_EXTERIOR /
     # CLASSIFIER_PATH come from the environment (Dockerfile defaults).
     log(f"  inference: {' '.join(cmd)}")
@@ -614,8 +711,14 @@ def process_job(job: dict) -> dict:
     post_status(job_id, "processing", fileCount=n_arws, totalBytes=total_bytes)
     log(f"    downloaded {n_arws} inputs from {raw_subfolder} ({total_bytes/1e9:.2f} GB)")
 
-    log("  [2/4] inference (rawpy → photomatix → restormer)")
-    pred_dir = run_inference(raw_dir, pred_root)
+    log("  [2/4] inference (rawpy → NAFNet stage1 → NAFNet stage2 → Stage 3 polish)")
+    # Stage 3 polish ckpt selection. Job.polishStyle (set per-shoot;
+    # eventually wired to a customer-facing style picker) overrides the
+    # AppSetting default. Resolver downloads ckpts to local cache on
+    # first use, returns {} if /api/settings is unreachable so the
+    # pipeline cleanly degrades to "no Stage 3".
+    polish_ckpts = resolve_polish_ckpts(job.get("polishStyle"))
+    pred_dir = run_inference(raw_dir, pred_root, polish_ckpts=polish_ckpts)
 
     log("  [3/4] auto-upright + EXIF/branding")
     upright_dir = run_upright(pred_dir, upright_root, raw_dir)
@@ -728,6 +831,11 @@ def process_job(job: dict) -> dict:
                         "productionR2Path": prod.get("productionR2Path"),
                         "sortOrder": prod.get("sortOrder"),
                         "cfImageId": prod.get("cfImageId"),
+                        # Stage 3 polish variant applied to this image
+                        # (null = Stage 3 skipped on this route). Passed
+                        # explicitly even when null so re-POSTs from the
+                        # backfill path can correct a previously-set value.
+                        "stage3Variant": cls.get("stage3Variant"),
                     })
                     n_cls += 1
                 except Exception as e:
