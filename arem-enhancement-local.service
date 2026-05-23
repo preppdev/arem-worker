@@ -1,0 +1,33 @@
+# systemd unit for the local 3090 autonomous-enhancement worker.
+# Install: sudo cp arem-enhancement-local.service /etc/systemd/system/ \
+#       && sudo systemctl daemon-reload \
+#       && sudo systemctl enable --now arem-enhancement-local.service
+# View logs: journalctl -u arem-enhancement-local -f
+# Restart:   sudo systemctl restart arem-enhancement-local
+# Stop:      sudo systemctl stop arem-enhancement-local
+#
+# Independent of arem-worker-local.service. Both can run concurrently —
+# they claim from different queues (/api/jobs/claim vs
+# /api/internal/enhancement-jobs/claim).
+
+[Unit]
+Description=AREM autonomous enhancement worker (Haiku detect → Nano Banana repair)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=-/etc/arem-worker.env
+Type=simple
+User=jordan
+Group=jordan
+WorkingDirectory=/home/jordan/arem-worker
+ExecStart=/bin/bash /home/jordan/arem-worker/run_enhancement_local.sh
+Restart=on-failure
+RestartSec=10
+KillMode=mixed
+TimeoutStopSec=120
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
