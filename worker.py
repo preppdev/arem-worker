@@ -53,6 +53,7 @@ import urllib.parse
 import requests  # type: ignore  # for Cloudflare Images multipart upload
 
 from pipeline import cc_ingest  # type: ignore  # AREM CC media-ingest POST
+from pipeline import pretagger  # type: ignore  # local arem-pretagger inference client
 
 # ---- config ----
 DASHBOARD_URL = os.environ.get("DASHBOARD_URL",
@@ -844,6 +845,46 @@ def process_job(job: dict) -> dict:
                 + (f" (skipped {n_skipped_existing} already-done stems)" if n_skipped_existing else ""))
     except Exception as e:
         log(f"  WARN thumbnail/classification step: {str(e)[:200]}")
+
+    # ── Pre-tag each deliverable via the local arem-pretagger service ──
+    # Best-effort: if the pretagger is down or unconfigured (no
+    # PRETAG_TOKEN), this whole block is a no-op and the reviewer just
+    # doesn't see suggestions for these images. Never blocks the
+    # pipeline. ImageReview.preTagConfidence is written from the
+    # dashboard side via /api/internal/pretag-result.
+    if pretagger.pretagger_enabled():
+        try:
+            n_pre_ok = 0
+            n_pre_skip = 0
+            for prod in production_records:
+                stem = prod.get("midStem")
+                if not stem:
+                    n_pre_skip += 1
+                    continue
+                local_file = upright_dir / (
+                    f"{stem}_stage2-int.jpg"
+                    if (upright_dir / f"{stem}_stage2-int.jpg").is_file()
+                    else f"{stem}_stage2-ext.jpg"
+                )
+                if not local_file.is_file():
+                    n_pre_skip += 1
+                    continue
+                resp = pretagger.pretag_image(local_file)
+                if not resp:
+                    n_pre_skip += 1
+                    continue
+                payload = pretagger.to_dashboard_payload(effective_job_id, stem, resp)
+                try:
+                    _post("/api/internal/pretag-result", payload)
+                    n_pre_ok += 1
+                except Exception as e:
+                    n_pre_skip += 1
+                    log(f"  WARN pretag-result POST for {stem}: {str(e)[:200]}")
+            log(f"  pretag: posted {n_pre_ok}/{len(production_records)} (skipped {n_pre_skip})")
+        except Exception as e:
+            log(f"  WARN pretag step: {str(e)[:200]}")
+    else:
+        log("  pretag: disabled (PRETAG_TOKEN not set)")
 
     # ── POST per-shoot asset batch to AREM Command Center ──────────────
     # Only photos with both productionR2Path AND cfImageId qualify —
