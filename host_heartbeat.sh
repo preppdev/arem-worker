@@ -89,6 +89,53 @@ except Exception:
     print('')
 " 2>/dev/null || echo "")
 
+# Also handle pending actions on sibling workers on this host. The
+# dashboard returns these in `siblingActions` whenever a host-*
+# workerId calls heartbeat. Without this block, restart_worker (which
+# the action API routes to the local-3090-* row, not the host row)
+# would sit pending forever — the host has sudo to restart the worker
+# unit but only sees its own pendingAction otherwise.
+SIBLING_ACTIONS=$(printf '%s' "$RESPONSE" | python3 -c "
+import sys, json
+try:
+    d = json.loads(sys.stdin.read())
+    for s in (d.get('siblingActions') or []):
+        wid = s.get('workerId',''); action = s.get('action','')
+        if wid and action:
+            print(wid + '\t' + action)
+except Exception:
+    pass
+" 2>/dev/null || echo "")
+
+if [ -n "$SIBLING_ACTIONS" ]; then
+  EXEC_JSON="["
+  FIRST=1
+  while IFS=$'\t' read -r SIB_ID SIB_ACTION; do
+    [ -z "$SIB_ID" ] && continue
+    echo "[heartbeat] sibling action: $SIB_ID -> $SIB_ACTION"
+    case "$SIB_ACTION" in
+      restart_worker)
+        sudo /bin/systemctl restart arem-worker-local.service
+        ;;
+      *)
+        echo "[heartbeat] unknown sibling action: $SIB_ACTION (skipping)"
+        continue
+        ;;
+    esac
+    if [ $FIRST -eq 0 ]; then EXEC_JSON+=","; fi
+    EXEC_JSON+="{\"workerId\":\"${SIB_ID}\",\"action\":\"${SIB_ACTION}\"}"
+    FIRST=0
+  done <<< "$SIBLING_ACTIONS"
+  EXEC_JSON+="]"
+  if [ $FIRST -eq 0 ]; then
+    curl -s -X POST "${DASHBOARD_URL}/api/internal/heartbeat" \
+      -H "Content-Type: application/json" \
+      -H "x-worker-token: ${WORKER_TOKEN:-}" \
+      -d "{\"workerId\":\"${WORKER_ID}\",\"metadata\":${METADATA},\"siblingExecutedActions\":${EXEC_JSON}}" \
+      --max-time 10 >/dev/null || true
+  fi
+fi
+
 if [ -z "$PENDING" ]; then
   exit 0
 fi
