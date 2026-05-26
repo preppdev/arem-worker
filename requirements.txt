@@ -1,7 +1,10 @@
 runpod>=1.6.0
-torch==2.4.1+cu124
-torchvision==0.19.1+cu124
---extra-index-url https://download.pytorch.org/whl/cu124
+# torch+torchvision pinned to CUDA 12.6 (sm_120 Blackwell support — see
+# Dockerfile FROM comment). Matches the local-3090 conda env so the same
+# Stage 1/2 checkpoints load byte-identical on either runtime.
+torch==2.10.0+cu126
+torchvision==0.25.0+cu126
+--extra-index-url https://download.pytorch.org/whl/cu126
 numpy>=1.26
 opencv-python-headless>=4.10
 rawpy>=0.21
