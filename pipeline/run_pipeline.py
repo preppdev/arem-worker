@@ -763,7 +763,8 @@ def process_shoot(raw_dir: Path, out_dir: Path,
                   stage1_ckpt: Path, int_ckpt: Path, ext_ckpt: Path,
                   clf_ckpt: Path,
                   polish_int_ckpt: Path | None = None,
-                  polish_ext_ckpt: Path | None = None) -> dict:
+                  polish_ext_ckpt: Path | None = None,
+                  skip_mid_stems: set[str] | None = None) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     s1_dir = out_dir / "stage1"
     s2_dir = out_dir / "stage2"
@@ -801,6 +802,30 @@ def process_shoot(raw_dir: Path, out_dir: Path,
     arws = list_arws(raw_dir)
     triplets, group_failures = find_triplets(arws)
     print(f"\n{raw_dir}: {len(arws)} ARWs → {len(triplets)} triplets", flush=True)
+
+    # Makeup-job optimization: the worker passes skip_mid_stems for the
+    # midStems that the parent already has finished JPGs for. Drop them
+    # before the per-triplet inference loop so we don't waste GPU time
+    # redoing them. The per-image POST step on the worker side ALSO
+    # filters on the same set (defensive), but doing it here is what
+    # actually saves wall-clock + GPU. Recorded as skip="already_done"
+    # in meta so the worker still sees them in the manifest for any
+    # auditing it does.
+    if skip_mid_stems:
+        kept = []
+        skipped_stems = []
+        for triplet in triplets:
+            stem = triplet[1].stem  # mid frame
+            if stem in skip_mid_stems:
+                skipped_stems.append(stem)
+            else:
+                kept.append(triplet)
+        if skipped_stems:
+            print(f"  skip_mid_stems: dropping {len(skipped_stems)} already-done "
+                  f"triplet(s) before inference (kept {len(kept)} for processing)",
+                  flush=True)
+        triplets = kept
+
     if group_failures:
         print(f"  ⚠ {len(group_failures)} grouping failures:", flush=True)
         for f in group_failures[:10]:
@@ -810,7 +835,8 @@ def process_shoot(raw_dir: Path, out_dir: Path,
 
     meta = {"raw_dir": str(raw_dir), "n_arws": len(arws),
             "n_triplets": len(triplets), "triplets": [],
-            "group_failures": group_failures}
+            "group_failures": group_failures,
+            "skipped_stems": sorted(skip_mid_stems) if skip_mid_stems else []}
     n_int = n_ext = 0
     grand_t0 = time.time()
 
@@ -1019,7 +1045,17 @@ def main():
     ap.add_argument("--classifier", type=Path,
                      default=Path(os.environ.get("CLASSIFIER_PATH",
                                                   "/workspace/pipeline/classifier_v2.pth")))
+    # Make-up optimization: the worker passes the midStems the parent
+    # already has finished JPGs for, so we can skip them at the
+    # triplet-loop level (where the expensive Stage 1/2/3 work happens).
+    # Comma-separated to keep the CLI simple. An empty string is a
+    # legal no-op (full reprocess).
+    ap.add_argument("--skip-mid-stems", type=str, default="",
+                     help="Comma-separated midStems to skip in the "
+                          "inference loop (used by make-up jobs to avoid "
+                          "redoing already-finished triplets).")
     args = ap.parse_args()
+    skip_set = {s.strip() for s in args.skip_mid_stems.split(",") if s.strip()}
 
     # Env fallbacks for polish ckpts — used when worker.py passes via env
     # rather than via flags. Worker prefers flags but env is the legacy
@@ -1033,7 +1069,8 @@ def main():
                   args.stage1_ckpt, args.interior_ckpt, args.exterior_ckpt,
                   args.classifier,
                   polish_int_ckpt=polish_int,
-                  polish_ext_ckpt=polish_ext)
+                  polish_ext_ckpt=polish_ext,
+                  skip_mid_stems=skip_set)
 
 
 if __name__ == "__main__":

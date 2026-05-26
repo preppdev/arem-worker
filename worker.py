@@ -349,13 +349,18 @@ def download_raws(dropbox_remote_path: str, local_raw_dir: Path) -> tuple[int, i
 
 
 def run_inference(local_raw_dir: Path, pred_root: Path,
-                  polish_ckpts: dict[str, Path | None] | None = None) -> Path:
+                  polish_ckpts: dict[str, Path | None] | None = None,
+                  skip_mid_stems: set[str] | None = None) -> Path:
     """Run the canonical Stage 1 (NAFNet) + Stage 2 (NAFNet routed) +
     Stage 3 (NAFNet polish, optional) pipeline.
 
     Calls pipeline/run_pipeline.py via subprocess to keep deps isolated.
     `polish_ckpts` is the resolved {"interior", "exterior"} dict from
     resolve_polish_ckpts(); None values disable Stage 3 for that route.
+    `skip_mid_stems` is the make-up optimisation: midStems whose JPGs
+    the parent already produced are excluded from the inference loop,
+    saving the Stage 1/2/3 GPU work. Empty/None = full reprocess.
+
     Returns the directory containing the final JPGs (still named
     <stem>_stage2-{int|ext}.jpg — Stage 3 overwrites Stage 2 in place
     so downstream paths don't change).
@@ -374,6 +379,9 @@ def run_inference(local_raw_dir: Path, pred_root: Path,
             cmd += ["--polish-interior-ckpt", str(polish_ckpts["interior"])]
         if polish_ckpts.get("exterior"):
             cmd += ["--polish-exterior-ckpt", str(polish_ckpts["exterior"])]
+    # Make-up skip set. Comma-separated to match the CLI flag's parsing.
+    if skip_mid_stems:
+        cmd += ["--skip-mid-stems", ",".join(sorted(skip_mid_stems))]
     # CHECKPOINT_STAGE1 / CHECKPOINT_INTERIOR / CHECKPOINT_EXTERIOR /
     # CLASSIFIER_PATH come from the environment (Dockerfile defaults).
     log(f"  inference: {' '.join(cmd)}")
@@ -719,7 +727,9 @@ def process_job(job: dict) -> dict:
     # first use, returns {} if /api/settings is unreachable so the
     # pipeline cleanly degrades to "no Stage 3".
     polish_ckpts = resolve_polish_ckpts(job.get("polishStyle"))
-    pred_dir = run_inference(raw_dir, pred_root, polish_ckpts=polish_ckpts)
+    pred_dir = run_inference(raw_dir, pred_root,
+                             polish_ckpts=polish_ckpts,
+                             skip_mid_stems=skip_mid_stems)
 
     log("  [3/4] auto-upright + EXIF/branding")
     upright_dir = run_upright(pred_dir, upright_root, raw_dir)
