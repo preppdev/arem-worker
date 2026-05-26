@@ -3,12 +3,13 @@
 # Restormer + Stage-1 NAFNet checkpoints (~1.2 GB) are downloaded from R2 at
 # handler init.
 
-# Base image must be CUDA 12.6+ to expose sm_120 (Blackwell). RunPod's
-# A5000/L4/3090 endpoint pool now allocates Blackwell PRO 6000 MIG
-# slices, which require sm_120 kernels. CUDA 12.4 here meant
-# CUDA-init failures and 100% unhealthy workers across the fleet
-# (incident 2026-05-15 → 2026-05-26).
-FROM nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04
+# Base image must be CUDA 12.8+ for sm_120 (Blackwell) kernel runtime
+# support. RunPod's A5000/L4/3090 endpoint pool now allocates Blackwell
+# PRO 6000 MIG slices, which require sm_120. CUDA 12.4 (and 12.6) here
+# meant CUDA-init failures and 100% unhealthy workers across the fleet
+# (incident 2026-05-15 → 2026-05-26). Must be paired with a PyTorch
+# wheel built against cu128+ — see requirements.txt comment.
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \

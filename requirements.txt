@@ -1,10 +1,13 @@
 runpod>=1.6.0
-# torch+torchvision pinned to CUDA 12.6 (sm_120 Blackwell support — see
-# Dockerfile FROM comment). Matches the local-3090 conda env so the same
-# Stage 1/2 checkpoints load byte-identical on either runtime.
-torch==2.10.0+cu126
-torchvision==0.25.0+cu126
---extra-index-url https://download.pytorch.org/whl/cu126
+# torch+torchvision must be cu128+ for sm_120 (Blackwell) kernel support.
+# cu126 wheels DON'T include sm_120 even though CUDA 12.6 supports it
+# in principle — PyTorch's pre-built wheels only ship sm_120 kernels in
+# cu128+ builds. PyTorch's own warning text on the cu126 build says
+# verbatim: "Please install PyTorch with a following CUDA
+# configurations: 12.8 13.0".
+torch==2.10.0+cu128
+torchvision==0.25.0+cu128
+--extra-index-url https://download.pytorch.org/whl/cu128
 numpy>=1.26
 opencv-python-headless>=4.10
 rawpy>=0.21
