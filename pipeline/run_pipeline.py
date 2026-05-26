@@ -183,11 +183,20 @@ def read_ev(arw: Path):
 # either. Frames once consumed by a triplet are not reused.
 ANCHOR_EV_ABS_MAX = 1.0
 
-# Two frames belong to the same bracket if their EXIF capture times are
-# within this many seconds. Camera AEB fires its 3 or 5 frames within
-# ~1 second; we leave headroom for the buffer-flush pause that some
-# cameras insert between the 3rd and 4th of a 5-shot bracket.
-MAX_BRACKET_GAP_SEC = 3.0
+# Safety-net upper bound on between-frame gap *within* a bracket.
+# We don't use this as the primary cluster boundary anymore — that's
+# done by EV-pattern detection (see Phase 3 in find_triplets_exif).
+# This constant only fires when the gap is so long there's no way the
+# frames belong to the same shutter-press sequence (photographer walked
+# to the next room, sat down, anything). 60s is comfortably longer than
+# even a 5-frame bracket with 2-second +EV exposures and write delay.
+#
+# Pre-2026-05-26 this was 3.0 and was the primary boundary, which
+# silently dropped any bracket whose +3 EV frame took >3s to capture
+# (long exposures in low-light interiors). T-1476 saw 6 of 18 triplets
+# split this way, repeated through 3 watchdog makeups producing the
+# same 12 JPGs each time. The EV-pattern split below is robust to that.
+MAX_BRACKET_GAP_SEC = 60.0
 
 
 def find_triplets(arws: list[Path]) -> tuple[list[tuple[Path, Path, Path]], list[dict]]:
@@ -352,13 +361,43 @@ def find_triplets_exif(arws: list[Path]) -> tuple[list[tuple[Path, Path, Path]],
     if dups_dropped:
         print(f"  find_triplets_exif: dropped {dups_dropped} exact duplicate(s)", flush=True)
 
-    # Phase 3: cluster into brackets by time gap
+    # Phase 3: cluster by EV-monotonicity (was time-gap pre-2026-05-26).
+    # Rationale: a long-exposure +3 EV frame in low light can take >3s
+    # after the mid frame, which used to split a single bracket into a
+    # (-3, 0) pair + an orphan (+3) — both fail the ≥3 check. T-1476
+    # lost 6 triplets this way; the 3 watchdog make-ups all produced
+    # the same 12 JPGs from 54 ARWs.
+    #
+    # Sony AEB (and Nikon, and our entire fleet today) writes brackets
+    # in strictly ascending EV order: 3-frame is (-EV, 0, +EV);
+    # 5-frame is (-EV_max, -EV_mid, 0, +EV_mid, +EV_max). A new
+    # bracket therefore announces itself as the first frame whose EV
+    # is LESS THAN the previous frame's EV — that's the monotonicity
+    # break.
+    #
+    # This is tighter than time-gap clustering in both directions:
+    #   - within bracket: any length gap is fine as long as EV keeps
+    #     ascending → fixes T-1476's slow-+3 problem
+    #   - between brackets: detected exactly at the transition, even
+    #     if brackets fire back-to-back with no perceptible time pause
+    #
+    # MAX_BRACKET_GAP_SEC stays as a safety net for pathological cases
+    # (e.g. EXIF timestamps lost / corrupted on a subset of frames).
+    #
+    # Constraint: this assumes ascending in-camera order. Sony Mark II/
+    # III and Nikon both do. If we ever add a camera that shoots
+    # mid-first (0, -EV, +EV) we'll need to detect that per-shoot and
+    # branch. Punt until we see it.
     clusters: list[list[dict]] = []
     cur: list[dict] = []
     for it in deduped:
-        if cur and (it["t"] - cur[-1]["t"]) > MAX_BRACKET_GAP_SEC:
-            clusters.append(cur)
-            cur = []
+        if cur:
+            prev_ev = cur[-1]["ev"]
+            monotonicity_break = it["ev"] < prev_ev
+            time_safety_break  = (it["t"] - cur[-1]["t"]) > MAX_BRACKET_GAP_SEC
+            if monotonicity_break or time_safety_break:
+                clusters.append(cur)
+                cur = []
         cur.append(it)
     if cur:
         clusters.append(cur)
