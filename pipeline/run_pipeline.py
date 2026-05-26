@@ -33,6 +33,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import traceback
@@ -674,15 +675,117 @@ def make_thumbnail(src: Path, dst: Path, max_long_edge: int = 512, quality: int 
     im.save(dst, "JPEG", quality=quality)
 
 
-def embed_classification_exif(jpg_path: Path, payload: dict) -> bool:
-    """Write classification JSON into EXIF UserComment so external tools
-    (Lightroom, exiftool, anyone reading the JPG bytes) can see the
-    worker's verdict without round-tripping through the dashboard.
-    Returns True on success, False if piexif isn't available.
+_EXIFTOOL_CFG = Path(__file__).resolve().parent / "exiftool_arem.cfg"
 
-    The UserComment tag is the standard EXIF freetext slot. We prepend
-    the ASCII charset prefix per the EXIF spec so well-behaved readers
-    parse it correctly."""
+
+def _find_exiftool() -> str | None:
+    """Locate the exiftool binary. PATH first; then a few well-known
+    install locations on the 3090. Returns None if nothing is found —
+    callers degrade to the JSON UserComment fallback."""
+    import shutil
+    p = shutil.which("exiftool")
+    if p:
+        return p
+    for cand in (
+        "/home/jordan/.local/bin/exiftool",  # 3090 default
+        "/usr/local/bin/exiftool",
+        "/opt/homebrew/bin/exiftool",  # Mac dev box
+    ):
+        if Path(cand).is_file() and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def embed_classification_exif(jpg_path: Path, payload: dict) -> bool:
+    """Bake the worker's room/interior classification into the JPG so it
+    survives Dropbox sync, vendor handoff, and any tool that opens the
+    file directly.
+
+    Writes three layers (any one alone is sufficient for a downstream
+    consumer; together they cover legacy + modern + custom workflows):
+
+      1. XMP-arem:* — custom namespace declared in exiftool_arem.cfg.
+         Highest-fidelity (typed boolean, real, strings) for our own
+         tooling. Requires the cfg to read back cleanly.
+      2. XMP-dc:Subject + IPTC:Keywords — multi-value keywords like
+         ["interior", "kitchen"]. Lightroom / Bridge / Finder show these.
+      3. EXIF UserComment — JSON blob, legacy compat. Any reader can
+         pick up the raw verdict without exiftool/XMP knowledge.
+
+    `payload` shape (from the call site in process_shoot):
+      { isInterior: bool, roomType: str|None, roomConfidence: float|None,
+        interiorConfidence: float, modelVersions: { room_classifier: str, ... },
+        stage3Variant: str|None, classifiedAt: ISO8601 str }
+
+    Returns True if exiftool succeeded; False if exiftool is missing or
+    errored. The JSON UserComment fallback writes regardless (via piexif)
+    so a missing exiftool binary doesn't lose the verdict entirely.
+    """
+    ok_exiftool = _write_xmp_iptc(jpg_path, payload)
+    _write_user_comment_json(jpg_path, payload)
+    return ok_exiftool
+
+
+def _write_xmp_iptc(jpg_path: Path, payload: dict) -> bool:
+    """Run exiftool to write the XMP-arem namespace + XMP-dc:Subject +
+    IPTC:Keywords in one subprocess. -overwrite_original because we
+    don't want the .original sidecar files cluttering output dirs."""
+    exiftool_bin = _find_exiftool()
+    if not exiftool_bin or not _EXIFTOOL_CFG.is_file():
+        return False
+    is_int = payload.get("isInterior")
+    room = payload.get("roomType")
+    room_conf = payload.get("roomConfidence")
+    int_conf = payload.get("interiorConfidence")
+    classifier_v = (payload.get("modelVersions") or {}).get("room_classifier")
+    stage3_v = payload.get("stage3Variant")
+    classified_at = payload.get("classifiedAt")
+
+    # Build the keywords list. Always include interior|exterior so
+    # filtering can group at that axis even when the room model
+    # declined to assign a class (exteriors, low-confidence interiors).
+    keywords: list[str] = []
+    if is_int is not None:
+        keywords.append("interior" if is_int else "exterior")
+    if room:
+        keywords.append(room)
+    if stage3_v:
+        keywords.append(f"polish:{stage3_v}")
+
+    cmd: list[str] = [
+        exiftool_bin, "-config", str(_EXIFTOOL_CFG),
+        "-overwrite_original",
+        # XMP-arem custom namespace
+        f"-XMP-arem:isInterior={'true' if is_int else 'false'}"
+        if is_int is not None else "-XMP-arem:isInterior=",
+        f"-XMP-arem:roomType={room or ''}",
+        f"-XMP-arem:roomConfidence={room_conf}" if room_conf is not None
+            else "-XMP-arem:roomConfidence=",
+        f"-XMP-arem:interiorConfidence={int_conf}" if int_conf is not None
+            else "-XMP-arem:interiorConfidence=",
+        f"-XMP-arem:classifierVersion={classifier_v or ''}",
+        f"-XMP-arem:classifiedAt={classified_at or ''}",
+        f"-XMP-arem:stage3Variant={stage3_v or ''}",
+    ]
+    # Multi-value tags: exiftool wants one -tag=value per item, with the
+    # first one clearing prior content via -=. We avoid -= because most of
+    # our outputs are fresh writes, so previous keywords aren't a concern.
+    for kw in keywords:
+        cmd += [f"-XMP-dc:Subject+={kw}", f"-IPTC:Keywords+={kw}"]
+    cmd.append(str(jpg_path))
+
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=15)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _write_user_comment_json(jpg_path: Path, payload: dict) -> bool:
+    """Legacy JSON-in-UserComment write. Kept for backward compat with
+    any tool that reads the EXIF UserComment slot directly (the
+    pre-XMP integration relied on it). Best-effort — piexif missing or
+    a malformed source JPG returns False without raising."""
     try:
         import piexif  # type: ignore
     except Exception:
