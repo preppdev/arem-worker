@@ -79,6 +79,27 @@ rclone copyto /tmp/startup.log \
   echo "[entrypoint] WARN: failed to upload startup marker"
 echo "[entrypoint] startup marker uploaded"
 
+# Continuous log-uploader: pushes /tmp/entrypoint.log to R2 every 5s
+# while the container runs. The EXIT trap also uploads, but if the
+# container is SIGKILL'd by RunPod's manager (startup timeout, OOM,
+# etc.) the trap doesn't fire — so without this tail-uploader we
+# would never see python's stderr from a crashed worker. The
+# upload is best-effort and silent on failure; if rclone hiccups we
+# just try again on the next tick.
+(
+  while sleep 5; do
+    [ -s "$LOG_FILE" ] || continue
+    rclone copyto "$LOG_FILE" \
+      "r2:arem-training-data/debug-logs/${host}-${ts_start}-live.log" \
+      --retries 1 --timeout 10s 2>/dev/null || true
+  done
+) &
+UPLOADER_PID=$!
+
+# Best-effort: stop the uploader when the foreground process exits
+# normally so we don't leave it running after a clean handler shutdown.
+trap "kill $UPLOADER_PID 2>/dev/null || true; upload_log" EXIT
+
 # ---- Checkpoints (one-time download per cold-started worker) ----
 mkdir -p /workspace/checkpoints
 fetch() {
