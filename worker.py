@@ -438,35 +438,79 @@ def run_upright(pred_dir: Path, upright_root: Path, raw_dir: Path) -> Path:
         # (e.g. no valid bracket window). Either path produces 0 JPGs;
         # show whichever bucket has data so the dashboard error category
         # is actually actionable.
+        #
+        # Message must accurately describe WHAT was detected and avoid
+        # blaming the input when the cause is worker-side strictness
+        # (the makeup grouper rejecting brackets the parent accepted is
+        # the canonical example). Specifically:
+        #   - "no triplets formed" + skipped_stems non-empty
+        #     → this is a makeup retry; the parent already produced
+        #       output from these files. Phrase as a worker-side decision.
+        #   - "no triplets formed" + no skipped_stems
+        #     → genuine first-pass failure; report cluster + reason counts.
+        #   - "triplets formed but all skipped"
+        #     → Stage 1/2/3 errors on otherwise-valid brackets.
         import json as _json
         meta_path = pred_dir.parent / "_meta.json"
         diag = ""
         n_arws = n_triplets = 0
+        n_groups_attempted = 0
+        is_makeup_retry = False
+        n_skipped_in_makeup = 0
         if meta_path.is_file():
             try:
                 meta = _json.loads(meta_path.read_text())
                 n_arws = meta.get("n_arws", 0)
                 n_triplets = meta.get("n_triplets", 0)
+                n_groups_attempted = len(meta.get("group_failures", []))
+                skipped = meta.get("skipped_stems", []) or []
+                is_makeup_retry = bool(skipped)
+                n_skipped_in_makeup = len(skipped)
                 from collections import Counter
-                skips = [t.get("skip", "") for t in meta.get("triplets", []) if t.get("skip")]
+                skips = [t.get("skip", "") for t in meta.get("triplets", [])
+                         if t.get("skip")]
                 if skips:
                     c = Counter(skips)
-                    diag = "; ".join(f"{n}× {r}" for r, n in c.most_common())
+                    diag = "; ".join(f"{n}× {r}" for r, n in c.most_common(4))
                 else:
                     grp = meta.get("group_failures", [])
                     if grp:
                         c = Counter(g.get("reason", "?") for g in grp)
-                        diag = "no valid brackets — " + "; ".join(
-                            f"{n}× {r}" for r, n in c.most_common())
+                        diag = "; ".join(f"{n}× {r}" for r, n in c.most_common(4))
             except Exception:
                 pass
+
         if n_triplets == 0:
-            msg = (f"no triplets formed from {n_arws} input files; "
-                   f"check shooting order / EXIF EV tags")
+            if is_makeup_retry:
+                # The parent run already produced output from these files.
+                # Naming it explicitly: the grouper is the bottleneck, not
+                # the input.
+                msg = (
+                    f"makeup retry produced no triplets: the bracket grouper "
+                    f"rejected all {n_groups_attempted} candidate bracket "
+                    f"window(s) from {n_arws} input frame(s). "
+                    f"Parent job already produced output for "
+                    f"{n_skipped_in_makeup} of these frames; this retry's "
+                    f"stricter grouping rules found no recoverable brackets "
+                    f"in the remainder. This is a worker-side regression, "
+                    f"not a shooting-order or EXIF issue with the photos."
+                )
+            else:
+                msg = (
+                    f"bracket grouper rejected all {n_groups_attempted} "
+                    f"candidate bracket window(s) from {n_arws} input "
+                    f"frame(s) — no valid (under/mid/over) sequence found. "
+                    f"Likely cause: bracketing pattern in EXIF EV doesn't "
+                    f"match the detector's expected layout."
+                )
         else:
-            msg = "no predicted JPGs — every triplet was skipped/failed"
+            n_triplet_total = len(meta.get("triplets", [])) if meta_path.is_file() else n_triplets
+            msg = (
+                f"all {n_triplet_total} formed triplets were skipped or "
+                f"failed during Stage 1/2/3 — no output JPGs produced."
+            )
         if diag:
-            msg += f" ({diag})"
+            msg += f" Top reasons: {diag}."
         raise RuntimeError(msg)
 
     cmd = [PYTHON_BIN, str(UPRIGHT_REPO / "auto_upright.py"),
