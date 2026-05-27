@@ -109,6 +109,7 @@ def get_backfill_jobs(
     since: str | None,
     job_id: str | None,
     force: bool,
+    reclassify_v1: bool = False,
 ) -> dict:
     sp = {"limit": str(limit), "offset": str(offset), "order": order}
     if since:
@@ -117,6 +118,8 @@ def get_backfill_jobs(
         sp["jobId"] = job_id
     if force:
         sp["force"] = "1"
+    if reclassify_v1:
+        sp["reclassifyV1"] = "1"
     qs = urllib.parse.urlencode(sp)
     return _request("GET", f"/api/internal/backfill-jobs?{qs}")
 
@@ -453,7 +456,10 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="classify + log, but skip R2 uploads and dashboard POSTs")
     ap.add_argument("--force", action="store_true",
-                    help="re-run classifier even for images that already have classifiedAt")
+                    help="re-run classifier on every image regardless of prior state")
+    ap.add_argument("--reclassify-v1", action="store_true",
+                    help="treat stage-1-only + v1-classified interior rows as needing "
+                         "(re-)classification by the active room ckpt. Exteriors stay done.")
     ap.add_argument("--no-vendor", action="store_true",
                     help="skip 05-Finished-Photos mirroring (ours-only)")
     ap.add_argument("--keep-scratch", action="store_true",
@@ -480,6 +486,7 @@ def main() -> int:
     resp = get_backfill_jobs(
         limit=args.limit, offset=args.offset, order=args.order,
         since=args.since, job_id=args.job, force=args.force,
+        reclassify_v1=args.reclassify_v1,
     )
     jobs = resp.get("jobs", [])
     log(f"  {len(jobs)} jobs to process (total candidates: {resp.get('total')})")
