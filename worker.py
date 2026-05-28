@@ -821,6 +821,7 @@ def process_job(job: dict) -> dict:
     grouping_warnings: list[dict] = []
     peak_vram_gb: float | None = None
     gpu_total_gb: float | None = None
+    n_triplets: int = 0
     meta_path = pred_root / "_meta.json"
     if meta_path.is_file():
         try:
@@ -828,6 +829,7 @@ def process_job(job: dict) -> dict:
             grouping_warnings = meta.get("group_failures", []) or []
             peak_vram_gb = meta.get("peak_vram_gb")
             gpu_total_gb = meta.get("gpu_total_gb")
+            n_triplets = int(meta.get("n_triplets") or 0)
         except Exception:
             pass
 
@@ -1078,6 +1080,13 @@ def process_job(job: dict) -> dict:
     result = {
         "jpegCount": n_jpg,
         "rawCount": n_arws,
+        # Authoritative count of valid (under/mid/over) brackets the
+        # grouper found in this shoot — the cap on physically-recoverable
+        # output. The watchdog uses this in preference to ceil(fileCount/3)
+        # to avoid creating doomed makeup retries on shoots where the
+        # photographer simply didn't have enough valid brackets in the
+        # input set (missing frames, bad EXIF EV, 2-frame fragments, etc.).
+        "bracketsFound": n_triplets,
         "totalBytes": total_bytes,
         "runtimeSec": runtime_sec,
         "rawSubfolder": raw_subfolder,
