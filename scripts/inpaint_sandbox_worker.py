@@ -54,7 +54,18 @@ RCLONE_R2 = os.environ.get("RCLONE_R2", "r2")
 R2_BUCKET = os.environ.get("R2_BUCKET", "arem-training-data")
 REQ_PREFIX = "inpaint-sandbox/requests"
 RES_PREFIX = "inpaint-sandbox/results"
-DEFAULT_METHODS = ["lama", "flux_fill", "object_clear"]
+DEFAULT_METHODS = ["lama"]
+
+
+def box_mask(image_bgr: np.ndarray, bbox) -> np.ndarray:
+    """Solid filled rectangle from a fractional {x,y,w,h} bbox."""
+    h, w = image_bgr.shape[:2]
+    x = bbox["x"]; y = bbox["y"]; bw = bbox["w"]; bh = bbox["h"]
+    x0 = int(round(x * w)); y0 = int(round(y * h))
+    x1 = int(round((x + bw) * w)); y1 = int(round((y + bh) * h))
+    m = np.zeros((h, w), np.uint8)
+    m[max(0, y0):min(h, y1), max(0, x0):min(w, x1)] = 255
+    return m
 
 
 def log(m: str) -> None:
@@ -155,11 +166,20 @@ def process(req: dict, scratch: Path) -> dict:
     if src is None:
         return {"id": rid, "status": "error", "error": "source decode failed"}
 
-    # 1) SAM2 clean mask from the box.
+    # 1) Build the removal mask.
+    #   maskMode="box" (default): the drawn rectangle, filled solid. Best
+    #     paired with LaMa for objects against plain walls/floors — full
+    #     coverage (incl. cords/legs) and LaMa can't invent furniture.
+    #   maskMode="sam": SAM2 tight object silhouette. Pair with ObjectClear
+    #     on complex/textured backgrounds where you need real synthesis.
+    mask_mode = req.get("maskMode", "box")
     try:
-        mask = box_to_mask(src, req["bbox"])
+        if mask_mode == "sam":
+            mask = box_to_mask(src, req["bbox"])
+        else:
+            mask = box_mask(src, req["bbox"])
     except Exception as e:
-        return {"id": rid, "status": "error", "error": f"sam mask failed: {e}"}
+        return {"id": rid, "status": "error", "error": f"mask ({mask_mode}) failed: {e}"}
     mask_local = scratch / f"{rid}__mask.png"
     cv2.imwrite(str(mask_local), mask)
     mask_key = f"{RES_PREFIX}/{rid}/mask.png"

@@ -56,7 +56,7 @@ def _to_pixel_box(bbox, w: int, h: int) -> list[float]:
     raise ValueError(f"unrecognized bbox: {bbox!r}")
 
 
-def box_to_mask(image_bgr: np.ndarray, bbox, dilate_px: int = 6) -> np.ndarray:
+def box_to_mask(image_bgr: np.ndarray, bbox, dilate_px: int = 10) -> np.ndarray:
     """Return a uint8 0/255 mask of the object SAM2 finds inside `bbox`.
 
     `dilate_px` slightly grows the mask so the inpainter also covers the
@@ -94,6 +94,15 @@ def box_to_mask(image_bgr: np.ndarray, bbox, dilate_px: int = 6) -> np.ndarray:
         # SAM found nothing meaningful — fall back to a filled box.
         mask = np.zeros((h, w), np.uint8)
         mask[int(y0):int(y1), int(x0):int(x1)] = 255
+    # Fill internal holes. SAM often masks an object's outer surface but
+    # leaves textured/specular sub-parts as unmasked islands (e.g. a lamp's
+    # body inside its masked shade). Those islands survive the removal as
+    # mangled ghosts, so close them. Flood-fill from the border: anything
+    # the fill can't reach is an interior hole.
+    ff = mask.copy()
+    flood_mask = np.zeros((h + 2, w + 2), np.uint8)
+    cv2.floodFill(ff, flood_mask, (0, 0), 255)
+    mask = cv2.bitwise_or(mask, cv2.bitwise_not(ff))
     if dilate_px > 0:
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
                                       (dilate_px * 2 + 1, dilate_px * 2 + 1))
