@@ -262,6 +262,9 @@ def make_method(name: str) -> Method:
     if n == "flux_kontext":
         from scripts.inpaint_methods.flux_kontext import FluxKontext
         return FluxKontext()
+    if n == "bria":
+        from scripts.inpaint_methods.bria_erase import BriaErase
+        return BriaErase()
     raise ValueError(f"unknown method: {name}")
 
 

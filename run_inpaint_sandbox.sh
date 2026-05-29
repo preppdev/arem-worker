@@ -28,6 +28,12 @@ if [ -z "${HF_TOKEN:-}" ] && [ -f "$HOME/.cache/huggingface/token" ]; then
   export HF_TOKEN="$(cat "$HOME/.cache/huggingface/token")"
 fi
 
+# Bria Eraser API key (premium full-res object removal). Kept outside the
+# repo; export it for the daemon if present.
+if [ -z "${BRIA_API_KEY:-}" ] && [ -f "$HOME/.bria_api_key" ]; then
+  export BRIA_API_KEY="$(cat "$HOME/.bria_api_key")"
+fi
+
 export RCLONE_R2="${RCLONE_R2:-r2}"
 export R2_BUCKET="${R2_BUCKET:-arem-training-data}"
 export SANDBOX_IDLE_UNLOAD_SEC="${SANDBOX_IDLE_UNLOAD_SEC:-300}"
