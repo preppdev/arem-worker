@@ -186,6 +186,35 @@ def process(req: dict, scratch: Path) -> dict:
     if src is None:
         return {"id": rid, "status": "error", "error": "source decode failed"}
 
+    # 0) Text-based erase (Bria erase_by_text): mask-free, the user just
+    #    names the object. Branches out before any mask work.
+    object_text = (req.get("objectText") or "").strip()
+    if object_text:
+        from scripts.inpaint_methods.bria_erase import erase_by_text
+        key = os.environ.get("BRIA_API_KEY")
+        if not key:
+            return {"id": rid, "status": "error", "error": "BRIA_API_KEY not set"}
+        try:
+            out = erase_by_text(src, object_text, key)
+        except Exception as e:
+            return {"id": rid, "status": "error", "error": f"erase_by_text: {e}"}
+        op = scratch / f"{rid}__bria_text.jpg"
+        cv2.imwrite(str(op), out, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+        res_key = f"{RES_PREFIX}/{rid}/bria_text.jpg"
+        put_file(op, res_key)
+        comp = build_composite(src, np.zeros(src.shape[:2], np.uint8),
+                               {f'bria · "{object_text[:40]}"': out})
+        cp = scratch / f"{rid}__composite.jpg"
+        cv2.imwrite(str(cp), comp, [int(cv2.IMWRITE_JPEG_QUALITY), 86])
+        comp_key = f"{RES_PREFIX}/{rid}/composite.jpg"
+        put_file(cp, comp_key)
+        return {
+            "id": rid, "status": "done",
+            "compositeR2Path": comp_key,
+            "results": {"bria_text": res_key},
+            "error": None, "runtimeMs": int((time.time() - t0) * 1000),
+        }
+
     # 1) Build the removal mask.
     #   maskMode="box" (default): the drawn rectangle, filled solid. Best
     #     paired with LaMa for objects against plain walls/floors — full
