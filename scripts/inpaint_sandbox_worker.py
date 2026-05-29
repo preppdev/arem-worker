@@ -57,6 +57,24 @@ RES_PREFIX = "inpaint-sandbox/results"
 DEFAULT_METHODS = ["lama"]
 
 
+def _close_peninsulas(mask: np.ndarray) -> np.ndarray:
+    """Morphological close to bridge narrow wall-gaps inside an object's
+    silhouette (e.g. between a lamp's shade and its base, where SAM leaves
+    the lamp neck unmasked). The kernel is sized to the object's smaller
+    dimension and capped, so it closes peninsulas without ballooning out
+    far enough to merge the object with an adjacent keep-object (a bed).
+    """
+    ys, xs = np.where(mask > 8)
+    if ys.size == 0:
+        return mask
+    bw = xs.max() - xs.min() + 1
+    bh = ys.max() - ys.min() + 1
+    k = int(0.25 * min(bw, bh))
+    k = max(31, min(81, k)) | 1  # odd, clamped 31..81
+    kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kern)
+
+
 def box_mask(image_bgr: np.ndarray, bbox) -> np.ndarray:
     """Solid filled rectangle from a fractional {x,y,w,h} bbox."""
     h, w = image_bgr.shape[:2]
@@ -176,6 +194,7 @@ def process(req: dict, scratch: Path) -> dict:
     try:
         if mask_mode == "sam":
             mask = box_to_mask(src, req["bbox"])
+            mask = _close_peninsulas(mask)
         else:
             mask = box_mask(src, req["bbox"])
     except Exception as e:
