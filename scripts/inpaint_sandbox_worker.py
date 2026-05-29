@@ -191,8 +191,23 @@ def process(req: dict, scratch: Path) -> dict:
     #   maskMode="sam": SAM2 tight object silhouette. Pair with ObjectClear
     #     on complex/textured backgrounds where you need real synthesis.
     mask_mode = req.get("maskMode", "box")
+    user_mask_key = req.get("maskR2Path")
     try:
-        if mask_mode == "sam":
+        if user_mask_key:
+            # Brush-refined mask painted in the dashboard. Authoritative —
+            # skip auto-generation entirely.
+            um_local = scratch / f"{rid}__usermask.png"
+            if not fetch_file(user_mask_key, um_local, R2_BUCKET):
+                return {"id": rid, "status": "error",
+                        "error": f"fetch user mask failed: {user_mask_key}"}
+            um = cv2.imread(str(um_local), cv2.IMREAD_GRAYSCALE)
+            if um is None:
+                return {"id": rid, "status": "error", "error": "user mask decode failed"}
+            if um.shape[:2] != src.shape[:2]:
+                um = cv2.resize(um, (src.shape[1], src.shape[0]),
+                                interpolation=cv2.INTER_NEAREST)
+            mask = (um > 127).astype(np.uint8) * 255
+        elif mask_mode == "sam":
             mask = box_to_mask(src, req["bbox"])
             mask = _close_peninsulas(mask)
         else:
