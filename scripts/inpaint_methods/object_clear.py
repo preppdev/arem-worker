@@ -8,6 +8,7 @@ short side to 512 for best results.
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -19,7 +20,10 @@ REPO_PATH = "/home/jordan/inpaint_models/ObjectClear_repo"
 MODEL_PATH = "/home/jordan/inpaint_models/objectclear"
 STEPS = 20
 GUIDANCE = 2.5
-SHORT_SIDE = 512
+# ObjectClear trained at 512; the ROI crop is resized so its short side
+# hits this before inference, then upscaled back. Higher = sharper fill
+# but further off the training distribution. Override via env for testing.
+SHORT_SIDE = int(os.environ.get("OBJECTCLEAR_SHORT_SIDE", "512"))
 
 
 def _resize_short_side(img: np.ndarray, target: int,
