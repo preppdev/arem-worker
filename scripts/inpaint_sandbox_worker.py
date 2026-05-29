@@ -212,6 +212,11 @@ def process(req: dict, scratch: Path) -> dict:
             "id": rid, "status": "done",
             "compositeR2Path": comp_key,
             "results": {"bria_text": res_key},
+            "primaryResultR2Path": res_key,
+            "sourceR2Path": src_key,
+            "sourceBucket": src_bucket,
+            "label": f'text·"{object_text[:40]}"',
+            "createdAt": req.get("createdAt") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "error": None, "runtimeMs": int((time.time() - t0) * 1000),
         }
 
@@ -277,12 +282,18 @@ def process(req: dict, scratch: Path) -> dict:
     comp_key = f"{RES_PREFIX}/{rid}/composite.jpg"
     put_file(cp, comp_key)
 
+    primary = next(iter(result_keys.values()), None)
     return {
         "id": rid,
         "status": "done" if result_keys else "error",
         "maskR2Path": mask_key,
         "compositeR2Path": comp_key,
         "results": result_keys,
+        "primaryResultR2Path": primary,
+        "sourceR2Path": src_key,
+        "sourceBucket": src_bucket,
+        "label": f"{mask_mode}·{'+'.join(methods)}",
+        "createdAt": req.get("createdAt") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "error": None if result_keys else "all methods failed",
         "runtimeMs": int((time.time() - t0) * 1000),
     }
