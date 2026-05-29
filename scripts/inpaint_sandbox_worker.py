@@ -229,23 +229,54 @@ def poll_once(scratch: Path) -> int:
     return n
 
 
+def unload_all() -> None:
+    """Free every cached inpaint model from the GPU. Called after the
+    daemon has been idle, so an always-on service doesn't permanently
+    hold ~10 GB away from the production workers sharing this 3090."""
+    if not _METHOD_CACHE:
+        return
+    for name, m in list(_METHOD_CACHE.items()):
+        try:
+            m.unload()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    _METHOD_CACHE.clear()
+    try:
+        import torch  # type: ignore
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    log("[sandbox] idle — unloaded models, GPU freed")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--loop", action="store_true", help="poll forever")
     ap.add_argument("--interval", type=int, default=5)
+    ap.add_argument("--idle-unload-sec", type=int,
+                    default=int(os.environ.get("SANDBOX_IDLE_UNLOAD_SEC", "300")),
+                    help="unload models from the GPU after this many idle "
+                         "seconds (0 disables)")
     args = ap.parse_args()
     with tempfile.TemporaryDirectory(prefix="arem-sandbox-") as sd:
         scratch = Path(sd)
         if not args.loop:
             poll_once(scratch)
             return 0
-        log("[sandbox] polling for requests…")
+        log(f"[sandbox] polling for requests (idle-unload={args.idle_unload_sec}s)…")
+        last_active = time.time()
         while True:
             try:
                 did = poll_once(scratch)
             except Exception as e:
                 log(f"[sandbox] poll error: {e}")
                 did = 0
+            now = time.time()
+            if did > 0:
+                last_active = now
+            elif (args.idle_unload_sec > 0 and _METHOD_CACHE
+                  and now - last_active > args.idle_unload_sec):
+                unload_all()
             time.sleep(args.interval if did == 0 else 0)
 
 

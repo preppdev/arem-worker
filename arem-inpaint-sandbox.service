@@ -1,0 +1,34 @@
+# systemd unit for the inpaint-sandbox daemon on the 3090.
+# Install: sudo cp arem-inpaint-sandbox.service /etc/systemd/system/ \
+#       && sudo systemctl daemon-reload \
+#       && sudo systemctl enable --now arem-inpaint-sandbox.service
+# View logs: journalctl -u arem-inpaint-sandbox -f
+# Restart:   sudo systemctl restart arem-inpaint-sandbox
+# Stop:      sudo systemctl stop arem-inpaint-sandbox
+#
+# Polls the R2 queue inpaint-sandbox/requests/ for dashboard-drawn boxes.
+# Lazy-loads models on first request, unloads after 5 min idle — safe to
+# run concurrently with arem-worker-local and arem-enhancement-local on
+# the shared GPU.
+
+[Unit]
+Description=AREM inpaint sandbox (box → SAM2 mask → local inpainters)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=-/etc/arem-worker.env
+Type=simple
+User=jordan
+Group=jordan
+WorkingDirectory=/home/jordan/arem-worker
+ExecStart=/bin/bash /home/jordan/arem-worker/run_inpaint_sandbox.sh
+Restart=on-failure
+RestartSec=10
+KillMode=mixed
+TimeoutStopSec=120
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
