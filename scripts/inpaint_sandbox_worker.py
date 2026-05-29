@@ -54,7 +54,9 @@ RCLONE_R2 = os.environ.get("RCLONE_R2", "r2")
 R2_BUCKET = os.environ.get("R2_BUCKET", "arem-training-data")
 REQ_PREFIX = "inpaint-sandbox/requests"
 RES_PREFIX = "inpaint-sandbox/results"
+CTRL_PREFIX = "inpaint-sandbox/control"
 DEFAULT_METHODS = ["lama"]
+START_TS = time.time()
 
 
 def _close_peninsulas(mask: np.ndarray) -> np.ndarray:
@@ -283,6 +285,65 @@ def poll_once(scratch: Path) -> int:
     return n
 
 
+def _code_version() -> str:
+    """Max mtime across the worker's own source files — lets the dashboard
+    tell whether a restart actually picked up newer code."""
+    files = [
+        "/home/jordan/arem-worker/scripts/inpaint_sandbox_worker.py",
+        "/home/jordan/arem-worker/scripts/sam_box_mask.py",
+        "/home/jordan/arem-worker/scripts/inpaint_methods/lama_onnx.py",
+        "/home/jordan/arem-worker/scripts/inpaint_methods/object_clear.py",
+    ]
+    mt = 0.0
+    for f in files:
+        try:
+            mt = max(mt, os.path.getmtime(f))
+        except OSError:
+            pass
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(mt))
+
+
+def write_heartbeat(scratch: Path, *, loaded: list[str]) -> None:
+    hb = scratch / "heartbeat.json"
+    hb.write_text(json.dumps({
+        "pid": os.getpid(),
+        "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(START_TS)),
+        "lastPollAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "codeVersion": _code_version(),
+        "modelsLoaded": loaded,
+    }))
+    put_file(hb, f"{CTRL_PREFIX}/heartbeat.json")
+
+
+def check_restart(scratch: Path) -> bool:
+    """If a restart was requested after we started, consume it and return
+    True. The caller then re-execs the process so new code loads."""
+    rf = scratch / "restart.json"
+    r = rclone(["copyto", f"{RCLONE_R2}:{R2_BUCKET}/{CTRL_PREFIX}/restart.json",
+                str(rf)])
+    if r.returncode != 0 or not rf.exists():
+        return False
+    try:
+        req_ts = json.loads(rf.read_text()).get("requestedAtEpoch", 0)
+    except Exception:
+        req_ts = time.time()  # malformed → treat as fresh
+    if req_ts <= START_TS:
+        return False  # stale signal from before this process started
+    # Consume so we don't loop-restart.
+    rclone(["deletefile", f"{RCLONE_R2}:{R2_BUCKET}/{CTRL_PREFIX}/restart.json"])
+    return True
+
+
+def reexec() -> None:
+    """Replace this process with a fresh one — reloads all .py from disk.
+    Inherits the current (systemd-provided) environment."""
+    log("[sandbox] restart requested — re-exec to reload code")
+    os.chdir("/home/jordan/arem-worker")
+    os.execv(sys.executable,
+             [sys.executable, "-m", "scripts.inpaint_sandbox_worker",
+              "--loop", "--interval", "5"])
+
+
 def unload_all() -> None:
     """Free every cached inpaint model from the GPU. Called after the
     daemon has been idle, so an always-on service doesn't permanently
@@ -319,7 +380,14 @@ def main() -> int:
             return 0
         log(f"[sandbox] polling for requests (idle-unload={args.idle_unload_sec}s)…")
         last_active = time.time()
+        last_hb = 0.0
         while True:
+            # Remote control: restart (re-exec to reload code).
+            try:
+                if check_restart(scratch):
+                    reexec()  # never returns
+            except Exception as e:
+                log(f"[sandbox] restart-check error: {e}")
             try:
                 did = poll_once(scratch)
             except Exception as e:
@@ -331,6 +399,13 @@ def main() -> int:
             elif (args.idle_unload_sec > 0 and _METHOD_CACHE
                   and now - last_active > args.idle_unload_sec):
                 unload_all()
+            # Heartbeat every ~30s so the dashboard can show liveness.
+            if now - last_hb > 30:
+                try:
+                    write_heartbeat(scratch, loaded=list(_METHOD_CACHE.keys()))
+                except Exception as e:
+                    log(f"[sandbox] heartbeat error: {e}")
+                last_hb = now
             time.sleep(args.interval if did == 0 else 0)
 
 
