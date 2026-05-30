@@ -186,6 +186,65 @@ def process(req: dict, scratch: Path) -> dict:
     if src is None:
         return {"id": rid, "status": "error", "error": "source decode failed"}
 
+    # 0b) Sky swap: reviewer (or auto-trigger) requested replacement with
+    #    a chosen plate. Source preserved, result written to a new R2 key,
+    #    dashboard flips productionR2Path on done.
+    if req.get("requestType") == "sky_swap":
+        try:
+            import sys as _sys
+            _sys.path.insert(0, "/home/jordan/arem-worker")
+            from scripts.sky_replace_v9_baseline import run_v9  # type: ignore
+        except Exception as e:
+            return {"id": rid, "status": "error",
+                    "error": f"v9 import: {e}"}
+        plate_bucket = req.get("plateBucket", R2_BUCKET)
+        plate_key = req.get("plateR2Path")
+        if not plate_key:
+            return {"id": rid, "status": "error", "error": "plateR2Path required"}
+        plate_local = scratch / f"{rid}__plate.jpg"
+        if not fetch_file(plate_key, plate_local, plate_bucket):
+            return {"id": rid, "status": "error",
+                    "error": f"fetch plate failed: {plate_key}"}
+        plate = cv2.imread(str(plate_local))
+        if plate is None:
+            return {"id": rid, "status": "error", "error": "plate decode failed"}
+        try:
+            alpha, result = run_v9(src, plate)
+        except Exception as e:
+            return {"id": rid, "status": "error", "error": f"sky_swap v9: {e}"}
+        op = scratch / f"{rid}__skyswap.jpg"
+        cv2.imwrite(str(op), result, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+        ts = int(time.time())
+        head, _, tail = src_key.rpartition(".")
+        result_key = f"{head}__skyswap_{ts}.{tail or 'jpg'}"
+        if not put_file(op, result_key, bucket=src_bucket):
+            return {"id": rid, "status": "error", "error": "upload sky_swap result failed"}
+        # Also keep a small thumbnail of alpha for review.
+        amask = (np.clip(alpha, 0, 1) * 255).astype(np.uint8)
+        mp = scratch / f"{rid}__skyswap_alpha.png"
+        cv2.imwrite(str(mp), amask)
+        alpha_key = f"{RES_PREFIX}/{rid}/skyswap_alpha.png"
+        put_file(mp, alpha_key)
+        return {
+            "id": rid, "status": "done",
+            "results": {"sky_swap": result_key},
+            "primaryResultR2Path": result_key,
+            "primaryResultBucket": src_bucket,
+            "alphaR2Path": alpha_key,
+            "sourceR2Path": src_key,
+            "sourceBucket": src_bucket,
+            "imageReviewId": req.get("imageReviewId"),
+            "jobId": req.get("jobId"),
+            "midStem": req.get("midStem"),
+            "skyImageId": req.get("skyImageId"),
+            "plateR2Path": plate_key,
+            "label": f"sky swap · plate {plate_key.split('/')[-1]}",
+            "createdAt": req.get("createdAt") or time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "error": None,
+            "runtimeMs": int((time.time() - t0) * 1000),
+        }
+
     # 0a) Upright re-run: reviewer flagged this image as still tilted.
     #    Bypass all mask logic. Run auto_upright with looser-than-global
     #    gates and write the result to a NEW R2 key (NOT in-place over the
