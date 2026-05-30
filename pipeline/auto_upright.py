@@ -289,18 +289,24 @@ def build_exif_dict(arw_meta: dict, year: int) -> bytes:
 
 
 def upright_one(img_path: Path, out_path: Path,
-                max_rotation_deg: float = 2.0,
-                min_vert_segs: int = 8,
-                max_residual_std_deg: float = 1.5,
+                max_rotation_deg: float = 3.5,
+                min_vert_segs: int = 6,
+                max_residual_std_deg: float = 2.0,
                 arw_root: Path = ARW_ROOT) -> dict:
     """Process one image: detect, rotate, crop. Returns metrics dict.
 
     Rotation is applied only when ALL of:
-      |estimated| <= max_rotation_deg  (real-estate handheld is rarely >2°)
+      |estimated| <= max_rotation_deg  (real-estate handheld is rarely >3.5°)
       n_vert     >= min_vert_segs      (enough verticals to trust the estimate)
       residual   <= max_residual_std_deg  (verticals agree with each other)
 
     Any failure → applied=0 (image kept straight) with `clamp_reason` set.
+
+    Gates loosened 2026-05-30 from (2.0, 8, 1.5) → (3.5, 6, 2.0) to act on
+    visibly-tilted production images that were previously left uncorrected
+    (the prior gates rejected ~5% of needs-correction shots). The hard cap
+    is intentionally still well below the rotation that would cause
+    significant crop loss.
     """
     t0 = time.time()
     img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)

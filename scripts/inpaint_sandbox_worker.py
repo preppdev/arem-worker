@@ -186,6 +186,67 @@ def process(req: dict, scratch: Path) -> dict:
     if src is None:
         return {"id": rid, "status": "error", "error": "source decode failed"}
 
+    # 0a) Upright re-run: reviewer flagged this image as still tilted.
+    #    Bypass all mask logic. Run auto_upright with looser-than-global
+    #    gates and write the result to a NEW R2 key (NOT in-place over the
+    #    source — that would destroy the original pixels). Dashboard then
+    #    updates ImageReview.productionR2Path to the new key.
+    if req.get("requestType") == "upright":
+        try:
+            import sys as _sys
+            _sys.path.insert(0, "/home/jordan/arem-worker")
+            from pipeline.auto_upright import (  # type: ignore
+                detect_segments, estimate_rotation, rotate_and_crop,
+            )
+            gray = cv2.cvtColor(src, cv2.COLOR_BGR2GRAY)
+            segs = detect_segments(gray)
+            rot_deg, n_vert, residual = estimate_rotation(segs)
+            cap = float(req.get("maxRotationDeg", 5.0))
+            min_segs = int(req.get("minVertSegs", 4))
+            max_residual = float(req.get("maxResidualDeg", 3.0))
+            if (abs(rot_deg) <= cap and n_vert >= min_segs and residual <= max_residual):
+                applied = float(rot_deg); clamp = None
+            else:
+                applied = 0.0
+                clamp = (
+                    "magnitude" if abs(rot_deg) > cap
+                    else "low_confidence_n_vert" if n_vert < min_segs
+                    else "low_confidence_residual"
+                )
+            out_img, _ = rotate_and_crop(src, applied)
+        except Exception as e:
+            return {"id": rid, "status": "error", "error": f"upright rerun: {e}"}
+        op = scratch / f"{rid}__uprighted.jpg"
+        cv2.imwrite(str(op), out_img, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+        # New key, source preserved. The dashboard updates the DB row.
+        ts = int(time.time())
+        head, _, tail = src_key.rpartition(".")
+        result_key = f"{head}__upright_{ts}.{tail or 'jpg'}"
+        if not put_file(op, result_key, bucket=src_bucket):
+            return {"id": rid, "status": "error", "error": "upload upright result failed"}
+        return {
+            "id": rid, "status": "done",
+            "results": {"upright": result_key},
+            "primaryResultR2Path": result_key,
+            "primaryResultBucket": src_bucket,
+            "sourceR2Path": src_key,
+            "sourceBucket": src_bucket,
+            "imageReviewId": req.get("imageReviewId"),
+            "jobId": req.get("jobId"),
+            "midStem": req.get("midStem"),
+            "label": (f"upright rerun "
+                      f"(rot={rot_deg:.2f}°→{applied:.2f}°, "
+                      f"n_vert={n_vert}, residual={residual:.2f}°"
+                      f"{', clamp=' + clamp if clamp else ''})"),
+            "createdAt": req.get("createdAt") or time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "error": None,
+            "runtimeMs": int((time.time() - t0) * 1000),
+            "uprightAppliedDeg": applied,
+            "uprightEstimatedDeg": float(rot_deg),
+            "uprightClampReason": clamp,
+        }
+
     # 0) Text-based erase (Bria erase_by_text): mask-free, the user just
     #    names the object. Branches out before any mask work.
     object_text = (req.get("objectText") or "").strip()
