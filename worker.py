@@ -594,6 +594,120 @@ def _cf_images_upload(local_path: Path, *, job_id: str, mid_stem: str,
         return None
 
 
+def _enqueue_sky_swap_for_shoot(
+    *,
+    production_records: list[dict],
+    triplets: list[dict],
+    dropbox_path: str,
+    job_id: str,
+) -> None:
+    """Queue one sky-swap job per exterior frame in the just-finished shoot.
+
+    All frames in the shoot get the SAME plate so the deliverable folder
+    reads as one consistent listing. Plate is picked from the approved
+    SkyImage library — random per shoot, seeded by job_id for stability
+    across retries (a retried job picks the same plate).
+
+    Best-effort: any failure is raised to the caller, which logs and
+    moves on.
+    """
+    import hashlib as _hashlib
+    import json as _json
+    import os as _os
+    import subprocess as _subprocess
+    import urllib.request as _urlreq
+    import urllib.error as _urlerr
+
+    # Stem → isInterior from the run's classifications. Falls back to
+    # treating unknown as interior (skip) — safer than mistakenly
+    # rewriting an indoor shot.
+    is_exterior_by_stem: dict[str, bool] = {}
+    for t in triplets:
+        stem = t.get("stem")
+        cls = t.get("classification") or {}
+        if stem is not None and "isInterior" in cls:
+            is_exterior_by_stem[stem] = cls.get("isInterior") is False
+
+    exterior_recs = [
+        r for r in production_records
+        if r.get("midStem") and is_exterior_by_stem.get(r["midStem"], False)
+    ]
+    if not exterior_recs:
+        log("  sky-swap enqueue: 0 exteriors in shoot, skipping")
+        return
+
+    # Pull approved plates from the dashboard.
+    dashboard_url = _os.environ.get(
+        "DASHBOARD_URL", "https://arem-editing-dashboard.vercel.app"
+    ).rstrip("/")
+    worker_token = _os.environ.get("WORKER_TOKEN", "")
+    try:
+        req = _urlreq.Request(
+            f"{dashboard_url}/api/internal/sky-library?status=approved&limit=60",
+            headers={"x-worker-token": worker_token},
+        )
+        with _urlreq.urlopen(req, timeout=30) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+    except (_urlerr.URLError, _urlerr.HTTPError) as e:
+        log(f"  sky-swap enqueue: list-plates fetch failed ({e}); skipping")
+        return
+    plates = [p for p in (data.get("items") or [])
+              if p.get("status") == "approved" and p.get("r2Path")]
+    if not plates:
+        log("  sky-swap enqueue: 0 approved plates in library, skipping")
+        return
+
+    # Pick one plate, seeded by job_id so retries are stable.
+    seed = int(_hashlib.sha256(job_id.encode()).hexdigest()[:8], 16)
+    plate = plates[seed % len(plates)]
+    log(f"  sky-swap enqueue: shoot plate "
+        f"{plate.get('category', '?')}/{plate['id'][:8]} for "
+        f"{len(exterior_recs)} exterior frames")
+
+    # Resolve imageReviewId per stem (best-effort: the dashboard's
+    # classification POST has already created the rows, but we don't have
+    # ids handy here; the daemon can update by jobId+midStem if needed,
+    # which we include).
+    enqueued = 0
+    for rec in exterior_recs:
+        stem = rec["midStem"]
+        src_key = rec.get("productionR2Path")
+        if not src_key:
+            continue
+        rid = f"{job_id}-{stem}-{int(time.time())}"
+        request = {
+            "id": rid,
+            "sourceBucket": "arem-production-edit-jobs",
+            "sourceR2Path": src_key,
+            "plateBucket": "arem-training-data",
+            "plateR2Path": plate["r2Path"],
+            "skyImageId": plate["id"],
+            "dropboxJobPath": dropbox_path,
+            "dropboxSubfolder": "08-Test-Edit/sky-swap",
+            "stem": stem,
+            "jobId": job_id,
+            "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        req_local = Path(f"/tmp/sky_swap_req_{rid}.json")
+        req_local.write_text(_json.dumps(request))
+        try:
+            r = _subprocess.run(
+                ["rclone", "copyto", str(req_local),
+                 f"r2:arem-training-data/sky-swap-jobs/requests/{rid}.json"],
+                capture_output=True, text=True, timeout=60,
+            )
+            if r.returncode == 0:
+                enqueued += 1
+            else:
+                log(f"  sky-swap enqueue: rclone fail {rid}: {r.stderr.strip()[:160]}")
+        finally:
+            try:
+                req_local.unlink()
+            except OSError:
+                pass
+    log(f"  sky-swap enqueue: queued {enqueued}/{len(exterior_recs)} jobs")
+
+
 def upload_outputs_production_r2(
     local_dir: Path,
     job_id: str,
@@ -941,6 +1055,23 @@ def process_job(job: dict) -> dict:
             log(f"  WARN pretag step: {str(e)[:200]}")
     else:
         log("  pretag: disabled (PRETAG_TOKEN not set)")
+
+    # ── Enqueue sky-swap variants for QC ───────────────────────────────
+    # Per-shoot dual-output: every exterior frame gets queued to the
+    # standalone sky-swap worker, which writes a sky-replaced variant to
+    # `<shoot>/08-Test-Edit/sky-swap/<stem>.jpg` on Dropbox. The original
+    # delivery is untouched; user flips between the two for QC.
+    # Best-effort — failures here are logged and never block the job.
+    if not manual and production_records:
+        try:
+            _enqueue_sky_swap_for_shoot(
+                production_records=production_records,
+                triplets=(meta or {}).get("triplets", []),
+                dropbox_path=dropbox_path,
+                job_id=effective_job_id,
+            )
+        except Exception as e:
+            log(f"  WARN sky-swap enqueue step: {str(e)[:200]}")
 
     # ── POST per-shoot asset batch to AREM Command Center ──────────────
     # Only photos with both productionR2Path AND cfImageId qualify —

@@ -1,0 +1,28 @@
+# systemd unit for the standalone sky-swap worker on the 3090.
+# Install: sudo cp arem-sky-swap.service /etc/systemd/system/ \
+#       && sudo systemctl daemon-reload \
+#       && sudo systemctl enable --now arem-sky-swap.service
+# Logs:    journalctl -u arem-sky-swap -f
+# Restart: sudo systemctl restart arem-sky-swap  (or use the dashboard button)
+
+[Unit]
+Description=AREM sky-swap worker (v9 plate composite, dual-output to Dropbox sky-swap subfolder)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=-/etc/arem-worker.env
+Type=simple
+User=jordan
+Group=jordan
+WorkingDirectory=/home/jordan/arem-worker
+ExecStart=/bin/bash /home/jordan/arem-worker/run_sky_swap.sh
+Restart=on-failure
+RestartSec=10
+KillMode=mixed
+TimeoutStopSec=120
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
