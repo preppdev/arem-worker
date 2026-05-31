@@ -55,6 +55,56 @@ ARW_ROOT = Path(os.environ.get("AREM_ARW_ROOT",
 # instead of ARW_ROOT/<shoot>/01-RAW-Photos/<stem>.ARW.
 ARW_FLAT = os.environ.get("AREM_ARW_FLAT_LAYOUT", "") in ("1", "true", "yes")
 
+# ── Upright engine (locked 2026-05-31) ──────────────────────────────────
+#
+# AREM_UPRIGHT_ENGINE:
+#   "geocalib" (default) — use GeoCalib (ETH CVG, ECCV 2024) deep camera
+#       calibration + the tuned damping recipe found vs Lightroom Auto on
+#       a 477-pair eval set. On full 477:
+#         p95 |Δrot|  vs LR: 1.74° → 1.12°  (-36%)
+#         p95 |Δvk|   vs LR: 3.66% → 2.44% (-33%)
+#         rot apply rate:    11.1% → 34.8% (LR is 44.7%)
+#         vk  apply rate:     0.0% → 29.4% (LR is 25.8%)
+#   "hough" — original classical line-segment median (kept as kill switch).
+#
+# UPRIGHT_GC_CONF_GATE: 0.03  — only apply correction when GeoCalib's
+#       up_confidence (mean of the predicted up-vector field) exceeds this.
+#       Lower means more frames get corrected; higher means more conservative.
+# UPRIGHT_GC_VK_SCALE: 0.7    — multiplier on the raw geometric pitch before
+#       deriving vertical-keystone strength. LR-style damping; reduces
+#       overshoot on the long tail.
+# UPRIGHT_GC_ROT_CLIP: 5.0    — hard cap on |rotation| (deg); larger gets
+#       clipped to 0 to avoid pathological warps from confidence outliers.
+UPRIGHT_ENGINE   = os.environ.get("AREM_UPRIGHT_ENGINE", "geocalib").lower()
+GC_CONF_GATE     = float(os.environ.get("UPRIGHT_GC_CONF_GATE", "0.03"))
+GC_VK_SCALE      = float(os.environ.get("UPRIGHT_GC_VK_SCALE",  "0.7"))
+GC_ROT_CLIP_DEG  = float(os.environ.get("UPRIGHT_GC_ROT_CLIP",  "5.0"))
+
+# Process-level lazy-load. False sentinel = load attempted and failed,
+# don't retry within this process; fall back to Hough silently.
+_GC_MODEL: object | None | bool = None
+
+def _get_geocalib_model():
+    global _GC_MODEL
+    if _GC_MODEL is not None:
+        return _GC_MODEL if _GC_MODEL is not False else None
+    if UPRIGHT_ENGINE != "geocalib":
+        _GC_MODEL = False
+        return None
+    try:
+        import torch  # noqa: F401  (ensures CUDA is reachable)
+        from geocalib import GeoCalib  # type: ignore
+        _GC_MODEL = GeoCalib().cuda().eval()
+        print(f"[auto_upright] GeoCalib loaded (engine=geocalib, "
+              f"conf_gate={GC_CONF_GATE} vk_scale={GC_VK_SCALE} "
+              f"rot_clip={GC_ROT_CLIP_DEG}°)", flush=True)
+        return _GC_MODEL
+    except Exception as e:
+        print(f"[auto_upright] GeoCalib unavailable ({type(e).__name__}: "
+              f"{str(e)[:120]}); falling back to Hough", flush=True)
+        _GC_MODEL = False
+        return None
+
 # sRGB ICC profile bytes (built once from PIL).
 _SRGB_PROFILE_BYTES: bytes | None = None
 
@@ -288,52 +338,146 @@ def build_exif_dict(arw_meta: dict, year: int) -> bytes:
                          "Interop": {}, "1st": {}, "thumbnail": None})
 
 
+def _gc_predict_and_warp(img_bgr: np.ndarray) -> tuple[np.ndarray | None, dict]:
+    """GeoCalib path: run prediction at 640px, build tuned homography,
+    return (warped+cropped image, metrics) or (None, metrics) if gates fail.
+
+    Caller decides whether to fall back to Hough.
+    """
+    model = _get_geocalib_model()
+    metrics: dict = {"engine": "geocalib"}
+    if model is None:
+        metrics["engine"] = "hough_fallback_no_model"
+        return None, metrics
+    try:
+        import torch
+        h, w = img_bgr.shape[:2]
+        rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        s = 640.0 / max(w, h)
+        small = cv2.resize(rgb, (int(round(w * s)), int(round(h * s))),
+                            interpolation=cv2.INTER_AREA) if s < 1.0 else rgb
+        img_t = torch.from_numpy(small).float().permute(2, 0, 1).cuda() / 255.0
+        with torch.no_grad():
+            r = model.calibrate(img_t)
+        roll_deg = float(r["gravity"].roll.item()) * 180.0 / math.pi
+        pitch_deg = float(r["gravity"].pitch.item()) * 180.0 / math.pi
+        vfov_deg = float(r["camera"].vfov.item()) * 180.0 / math.pi
+        up_conf = float(r["up_confidence"].mean().item())
+    except Exception as e:
+        metrics["engine"] = "hough_fallback_exception"
+        metrics["gc_error"] = f"{type(e).__name__}: {str(e)[:120]}"
+        return None, metrics
+
+    metrics.update({
+        "gc_roll_deg":  round(roll_deg, 3),
+        "gc_pitch_deg": round(pitch_deg, 3),
+        "gc_vfov_deg":  round(vfov_deg, 2),
+        "gc_up_conf":   round(up_conf, 4),
+    })
+    if up_conf <= GC_CONF_GATE:
+        metrics["applied"] = False
+        metrics["skip_reason"] = "low_up_confidence"
+        return img_bgr.copy(), metrics
+
+    # Apply tuned damping
+    roll_eff = 0.0 if abs(roll_deg) > GC_ROT_CLIP_DEG else roll_deg
+    pitch_eff = pitch_deg * GC_VK_SCALE
+    metrics["gc_roll_applied_deg"]  = round(roll_eff, 3)
+    metrics["gc_pitch_applied_deg"] = round(pitch_eff, 3)
+    if roll_eff == 0.0 and pitch_eff == 0.0:
+        metrics["applied"] = False
+        metrics["skip_reason"] = "zero_after_damping"
+        return img_bgr.copy(), metrics
+
+    # Build K @ R @ K^-1 homography
+    cx, cy = w / 2.0, h / 2.0
+    f_px = h / (2.0 * math.tan(math.radians(vfov_deg) / 2.0))
+    K = np.array([[f_px, 0, cx], [0, f_px, cy], [0, 0, 1]], dtype=np.float64)
+    K_inv = np.linalg.inv(K)
+    rr = math.radians(roll_eff); pp = math.radians(pitch_eff)
+    cp, sp = math.cos(pp), math.sin(pp)
+    Rx = np.array([[1, 0, 0], [0, cp, -sp], [0, sp, cp]], dtype=np.float64)
+    cr, sr = math.cos(rr), math.sin(rr)
+    Rz = np.array([[cr, -sr, 0], [sr, cr, 0], [0, 0, 1]], dtype=np.float64)
+    H = K @ Rz @ Rx @ K_inv
+
+    warped = cv2.warpPerspective(img_bgr, H, (w, h),
+        flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REPLICATE)
+    corners = np.float32([[0, 0], [w, 0], [w, h], [0, h]]).reshape(-1, 1, 2)
+    dc = cv2.perspectiveTransform(corners, H).reshape(-1, 2)
+    xs = sorted(dc[:, 0]); ys = sorted(dc[:, 1])
+    x0 = max(int(math.ceil(xs[1])), 0); x1 = min(int(math.floor(xs[2])), w)
+    y0 = max(int(math.ceil(ys[1])), 0); y1 = min(int(math.floor(ys[2])), h)
+    if x1 <= x0 or y1 <= y0:
+        out = warped
+    else:
+        out = warped[y0:y1, x0:x1]
+    metrics["applied"] = True
+    metrics["gc_size_out"] = list(out.shape[:2])
+    return out, metrics
+
+
 def upright_one(img_path: Path, out_path: Path,
                 max_rotation_deg: float = 3.5,
                 min_vert_segs: int = 6,
                 max_residual_std_deg: float = 2.0,
                 arw_root: Path = ARW_ROOT) -> dict:
-    """Process one image: detect, rotate, crop. Returns metrics dict.
+    """Process one image. Engine selected by env (default GeoCalib).
 
-    Rotation is applied only when ALL of:
-      |estimated| <= max_rotation_deg  (real-estate handheld is rarely >3.5°)
-      n_vert     >= min_vert_segs      (enough verticals to trust the estimate)
-      residual   <= max_residual_std_deg  (verticals agree with each other)
+    GeoCalib path (UPRIGHT_ENGINE=geocalib, default):
+      - Predicts (roll, pitch, vfov) + per-pixel up-vector confidence
+      - Gates by mean up_confidence > GC_CONF_GATE
+      - Damps pitch → vk by GC_VK_SCALE (LR-style perception damping)
+      - Clips |roll| > GC_ROT_CLIP_DEG (safety against outlier predictions)
+      - Builds K@R@K^-1 homography, warps, crops to interior rect
 
-    Any failure → applied=0 (image kept straight) with `clamp_reason` set.
+    Hough fallback (UPRIGHT_ENGINE=hough OR GeoCalib import/runtime fails):
+      - Original classical: LSD line segments → weighted-median rotation,
+        gated on |rot|/n_verts/residual_std, then rotate+crop.
 
-    Gates loosened 2026-05-30 from (2.0, 8, 1.5) → (3.5, 6, 2.0) to act on
-    visibly-tilted production images that were previously left uncorrected
-    (the prior gates rejected ~5% of needs-correction shots). The hard cap
-    is intentionally still well below the rotation that would cause
-    significant crop loss.
+    Both paths share the same EXIF + sRGB ICC baking on output.
     """
     t0 = time.time()
     img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
     if img is None:
         return {"path": str(img_path), "error": "imread_failed"}
     h, w = img.shape[:2]
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    segs = detect_segments(gray)
-    rot_deg, n_vert, residual = estimate_rotation(segs)
+    # ── Engine: GeoCalib (default) ─────────────────────────────────────
+    gc_out, gc_metrics = (None, {"engine": "skipped"})
+    if UPRIGHT_ENGINE == "geocalib":
+        gc_out, gc_metrics = _gc_predict_and_warp(img)
 
-    clamp_reason: str | None = None
-    if abs(rot_deg) > max_rotation_deg:
-        clamp_reason = "magnitude"
-    elif n_vert < min_vert_segs:
-        clamp_reason = "low_confidence_n_vert"
-    elif residual > max_residual_std_deg:
-        clamp_reason = "low_confidence_residual"
-
-    if clamp_reason is not None:
-        applied = 0.0
-        clamped = True
+    if gc_out is not None:
+        out_img = gc_out
+        area_ratio = (out_img.shape[0] * out_img.shape[1]) / (h * w)
+        applied = float(gc_metrics.get("gc_roll_applied_deg", 0.0))
+        clamped = not gc_metrics.get("applied", False)
+        clamp_reason = gc_metrics.get("skip_reason")
+        rot_deg = float(gc_metrics.get("gc_roll_deg", 0.0))
+        n_vert = -1
+        residual = -1.0
     else:
-        applied = rot_deg
-        clamped = False
+        # ── Fallback: classical Hough/LSD ──────────────────────────────
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        segs = detect_segments(gray)
+        rot_deg, n_vert, residual = estimate_rotation(segs)
+        clamp_reason = None
+        if abs(rot_deg) > max_rotation_deg:
+            clamp_reason = "magnitude"
+        elif n_vert < min_vert_segs:
+            clamp_reason = "low_confidence_n_vert"
+        elif residual > max_residual_std_deg:
+            clamp_reason = "low_confidence_residual"
+        if clamp_reason is not None:
+            applied = 0.0
+            clamped = True
+        else:
+            applied = rot_deg
+            clamped = False
+        out_img, area_ratio = rotate_and_crop(img, applied)
+        gc_metrics = {"engine": gc_metrics.get("engine", "hough")}
 
-    out_img, area_ratio = rotate_and_crop(img, applied)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_rgb = cv2.cvtColor(out_img, cv2.COLOR_BGR2RGB)
 
@@ -383,6 +527,7 @@ def upright_one(img_path: Path, out_path: Path,
         "crop_area_ratio": round(area_ratio, 4),
         "exif_source_arw": arw_path.name if arw_meta else None,
         "elapsed_ms": round((time.time() - t0) * 1000),
+        **gc_metrics,
     }
 
 
