@@ -1061,43 +1061,64 @@ def process_job(job: dict) -> dict:
     # new sky (dull / overcast / hazy). Clear-blue and golden-hour shoots
     # are left alone. Per-shoot decision is in pipeline.sky_quality;
     # exterior locals from upright_dir.
+    #
+    # Override knobs (env):
+    #   AREM_SKY_SWAP_FORCE=1  bypass the quality gate and trigger on
+    #                          every shoot — useful for QA sweeps. Pair
+    #                          with AREM_SKY_SWAP_DROPBOX_SUBFOLDER if
+    #                          you want results in a separate folder.
+    #   AREM_SKY_SWAP_OFF=1    never trigger sky-swap. Hard kill switch.
+    #
     # Best-effort — failures here are logged and never block the job.
     if not manual and production_records:
         try:
-            from pipeline.sky_quality import should_swap_shoot  # type: ignore
-            # Map midStem → isExterior from triplets
-            _is_ext_by_stem: dict[str, bool] = {}
-            for t in (meta or {}).get("triplets", []) or []:
-                _stem = t.get("stem")
-                _cls = t.get("classification") or {}
-                if _stem is not None and "isInterior" in _cls:
-                    _is_ext_by_stem[_stem] = _cls.get("isInterior") is False
-            _ext_stems = [r["midStem"] for r in production_records
-                           if r.get("midStem") and _is_ext_by_stem.get(r["midStem"], False)]
-            _shoot_subdir = Path(dropbox_path).name if dropbox_path else None
-            _ext_paths: list[Path] = []
-            if _shoot_subdir:
-                for _ms in _ext_stems:
-                    _p = upright_dir / _shoot_subdir / f"{_ms}.jpg"
-                    if _p.is_file():
-                        _ext_paths.append(_p)
-            if _ext_paths:
-                _trigger, _summary = should_swap_shoot(_ext_paths)
-                log(f"  sky-quality: trigger={_trigger}  "
-                    f"mean_dull={_summary.get('weighted_mean_dull')}  "
-                    f"frac_high={_summary.get('frac_high_dull')}  "
-                    f"n_with_sky={_summary.get('n_with_sky')}/{_summary.get('n_frames')}")
-                if _trigger:
-                    _enqueue_sky_swap_for_shoot(
-                        production_records=production_records,
-                        triplets=(meta or {}).get("triplets", []),
-                        dropbox_path=dropbox_path,
-                        job_id=effective_job_id,
-                    )
-                else:
-                    log("  sky-swap: skipped (sky conditions look good)")
+            _force = os.environ.get("AREM_SKY_SWAP_FORCE", "").lower() in ("1", "true", "yes")
+            _off   = os.environ.get("AREM_SKY_SWAP_OFF",   "").lower() in ("1", "true", "yes")
+            if _off:
+                log("  sky-swap: AREM_SKY_SWAP_OFF set — skipping")
+            elif _force:
+                log("  sky-swap: AREM_SKY_SWAP_FORCE set — bypassing quality gate, triggering on every shoot")
+                _enqueue_sky_swap_for_shoot(
+                    production_records=production_records,
+                    triplets=(meta or {}).get("triplets", []),
+                    dropbox_path=dropbox_path,
+                    job_id=effective_job_id,
+                )
             else:
-                log("  sky-quality: no exterior locals — skipping analysis")
+                from pipeline.sky_quality import should_swap_shoot  # type: ignore
+                # Map midStem → isExterior from triplets
+                _is_ext_by_stem: dict[str, bool] = {}
+                for t in (meta or {}).get("triplets", []) or []:
+                    _stem = t.get("stem")
+                    _cls = t.get("classification") or {}
+                    if _stem is not None and "isInterior" in _cls:
+                        _is_ext_by_stem[_stem] = _cls.get("isInterior") is False
+                _ext_stems = [r["midStem"] for r in production_records
+                               if r.get("midStem") and _is_ext_by_stem.get(r["midStem"], False)]
+                _shoot_subdir = Path(dropbox_path).name if dropbox_path else None
+                _ext_paths: list[Path] = []
+                if _shoot_subdir:
+                    for _ms in _ext_stems:
+                        _p = upright_dir / _shoot_subdir / f"{_ms}.jpg"
+                        if _p.is_file():
+                            _ext_paths.append(_p)
+                if _ext_paths:
+                    _trigger, _summary = should_swap_shoot(_ext_paths)
+                    log(f"  sky-quality: trigger={_trigger}  "
+                        f"mean_dull={_summary.get('weighted_mean_dull')}  "
+                        f"frac_high={_summary.get('frac_high_dull')}  "
+                        f"n_with_sky={_summary.get('n_with_sky')}/{_summary.get('n_frames')}")
+                    if _trigger:
+                        _enqueue_sky_swap_for_shoot(
+                            production_records=production_records,
+                            triplets=(meta or {}).get("triplets", []),
+                            dropbox_path=dropbox_path,
+                            job_id=effective_job_id,
+                        )
+                    else:
+                        log("  sky-swap: skipped (sky conditions look good)")
+                else:
+                    log("  sky-quality: no exterior locals — skipping analysis")
         except Exception as e:
             log(f"  WARN sky-quality / sky-swap step: {str(e)[:200]}")
 
