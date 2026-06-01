@@ -280,6 +280,42 @@ def fit_plate(plate_bgr, target_h, target_w, seed=None, flip=False,
     return canvas
 
 
+def match_plate_luminance(plate_bgr, src_bgr, alpha, *,
+                          min_alpha=0.95, min_shift=10.0, strength=1.0):
+    """L-channel match: shift plate's mean L (Lab) toward the source's
+    existing sky-region mean L, leaving a/b (chroma) untouched. This is
+    "variant E" from the plate-matching study — fixes the dominant
+    brightness clash between a saturated stock plate and the source's
+    actual scene illumination, without disturbing the plate's color
+    character.
+
+    Skips the adjustment when:
+      - fewer than 100 source pixels reach alpha >= min_alpha
+        (not enough sky to sample reliably)
+      - the would-be shift is below min_shift L units
+        (plate already roughly matches; nothing to do)
+    """
+    import os as _os
+    if _os.environ.get("SKY_V9_PLATE_LUMA_MATCH", "1").lower() not in ("1", "true", "yes"):
+        return plate_bgr
+    _strength = float(_os.environ.get("SKY_V9_PLATE_LUMA_STRENGTH", str(strength)))
+    _min_shift = float(_os.environ.get("SKY_V9_PLATE_LUMA_MIN_SHIFT", str(min_shift)))
+    _min_alpha = float(_os.environ.get("SKY_V9_PLATE_LUMA_MIN_ALPHA", str(min_alpha)))
+
+    sky_mask = alpha >= _min_alpha
+    if int(sky_mask.sum()) < 100:
+        return plate_bgr
+    src_l = cv2.cvtColor(src_bgr, cv2.COLOR_BGR2LAB)[..., 0].astype(np.float32)
+    src_l_mean = float(src_l[sky_mask].mean())
+    plate_lab = cv2.cvtColor(plate_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    plate_l_mean = float(plate_lab[..., 0].mean())
+    delta = (src_l_mean - plate_l_mean) * _strength
+    if abs(delta) < _min_shift:
+        return plate_bgr
+    plate_lab[..., 0] = np.clip(plate_lab[..., 0] + delta, 0, 255)
+    return cv2.cvtColor(plate_lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+
 def composite(plate, src_decontam, alpha):
     a = alpha[..., None].astype(np.float32)
     out = plate.astype(np.float32) * a + src_decontam.astype(np.float32) * (1 - a)
@@ -340,7 +376,11 @@ def run_v9(src, plate, plate_seed=None, flip_plate=False,
     alpha = demote_islands(alpha_exp)
     sky_bgr = estimate_sky_color(src, alpha)
     src_clean = decontaminate_spill(src, alpha, sky_bgr)
-    plate_fit = fit_plate(plate, src.shape[0], src.shape[1],
+    # Match the plate's brightness to the source's existing sky so the
+    # composite doesn't show a hard step where partial-α leaks the
+    # original through. L-only — keeps the plate's blue character.
+    plate_matched = match_plate_luminance(plate, src, alpha)
+    plate_fit = fit_plate(plate_matched, src.shape[0], src.shape[1],
                           seed=plate_seed, flip=flip_plate,
                           vertical_extent=vertical_extent)
     result = composite(plate_fit, src_clean, alpha)
