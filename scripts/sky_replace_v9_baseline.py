@@ -306,18 +306,32 @@ def run_v9(src, plate, plate_seed=None, flip_plate=False,
     gradient with a typical source horizon. Pass 1.0 to disable.
     """
     coarse = skyseg_alpha(src)
-    # Guard: if the skyseg only fires on a tiny region (small overhead
-    # light, skylight slit, bright wall fragment), don't composite —
-    # those false positives sink the result on interior hallways and
-    # window-only kitchen shots. Real exteriors have ≥5% sky; even
-    # tight tree-canopy shots clear 1%.
+    # Guards: refuse to composite when the detected "sky" is too small
+    # OR is in the wrong part of the frame. Both protect against
+    # interior false positives (skylight slit, hallway light, bright
+    # wall, kitchen window glare).
     import os as _os
+    import numpy as _np
+    _bin = coarse >= 0.5
+    _n_sky = int(_bin.sum())
+    _cov = _n_sky / max(1, _bin.size)
     _min_cov = float(_os.environ.get("SKY_V9_MIN_COVERAGE", "0.005"))
-    _cov = float((coarse >= 0.5).mean())
     if _cov < _min_cov:
         raise RuntimeError(
             f"insufficient sky coverage ({_cov:.4f} < {_min_cov:.4f}) — "
             f"likely a false positive on a small bright region"
+        )
+    # Spatial: real outdoor sky in an exterior shot sits in the upper
+    # portion of the frame. If most of the "sky" mass is in the lower
+    # half, we're almost certainly looking at a window/light/ceiling
+    # fixture inside, not actual sky.
+    _h_src = _bin.shape[0]
+    _top_frac = float(_bin[:_h_src // 2, :].sum()) / max(1, _n_sky)
+    _min_top  = float(_os.environ.get("SKY_V9_MIN_TOP_FRAC", "0.60"))
+    if _top_frac < _min_top:
+        raise RuntimeError(
+            f"sky mass not in top half ({_top_frac:.2f} < {_min_top:.2f}) — "
+            f"likely a window/skylight/fixture, not exterior sky"
         )
     trimap = build_trimap(coarse)
     alpha_raw = closed_form_matting(src, trimap)
