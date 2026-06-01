@@ -686,6 +686,11 @@ def _enqueue_sky_swap_for_shoot(
             "dropboxSubfolder": "08-Test-Edit/sky-swap",
             "stem": stem,
             "jobId": job_id,
+            # Defense in depth — the auto-hook already filtered exterior_recs
+            # above, so this is always false here. Daemon's EXIF gate is the
+            # primary check; this is the secondary source of truth in case
+            # the EXIF passthrough in auto_upright failed for any reason.
+            "isInterior": False,
             "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         req_local = Path(f"/tmp/sky_swap_req_{rid}.json")

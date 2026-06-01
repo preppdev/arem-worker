@@ -510,6 +510,21 @@ def upright_one(img_path: Path, out_path: Path,
             pass
 
     exif_bytes = build_exif_dict(arw_meta, year)
+    # Preserve classification UserComment that run_pipeline.py (stage 3)
+    # embedded in the input JPG via _write_user_comment_json. Without
+    # this passthrough, stage 5 (sky-swap) and any downstream consumer
+    # loses the interior/exterior verdict and has to fall back to
+    # brittle heuristics. Best-effort: a missing/malformed UserComment
+    # leaves the dict alone.
+    try:
+        _src_exif = piexif.load(str(img_path))
+        _uc = _src_exif.get("Exif", {}).get(piexif.ExifIFD.UserComment)
+        if _uc:
+            _out = piexif.load(exif_bytes)
+            _out.setdefault("Exif", {})[piexif.ExifIFD.UserComment] = _uc
+            exif_bytes = piexif.dump(_out)
+    except Exception:
+        pass
     Image.fromarray(out_rgb).save(out_path, quality=92,
                                    exif=exif_bytes,
                                    icc_profile=_srgb_profile_bytes())

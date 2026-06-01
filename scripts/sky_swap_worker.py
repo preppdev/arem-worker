@@ -200,8 +200,67 @@ def process(req: dict, scratch: Path) -> dict:
     if src is None or plate is None:
         return {"id": rid, "status": "error", "error": "decode failed"}
 
+    # ── Interior gate (stage 5 defense) ──────────────────────────────
+    # Two sources of truth, in priority order:
+    #   1. EXIF UserComment JSON (embedded by run_pipeline.py at stage 3,
+    #      preserved through stage 4 auto_upright via piexif passthrough)
+    #   2. req["isInterior"] (producer-supplied; auto-hook sets this from
+    #      triplets, manual scripts may pass it explicitly)
+    # Fail closed: if neither source identifies the frame as exterior,
+    # refuse to composite. Interior frames produce false-positive sky
+    # paint on bright windows/skylights/fixtures (see DSC07561, etc.).
+    def _classification_from_exif(jpg: Path) -> dict | None:
+        try:
+            import piexif as _pe, json as _j
+            ex = _pe.load(str(jpg))
+            uc = ex.get("Exif", {}).get(_pe.ExifIFD.UserComment)
+            if not uc: return None
+            # Format: b"ASCII\x00\x00\x00" + json_bytes
+            if isinstance(uc, bytes) and uc.startswith(b"ASCII\x00\x00\x00"):
+                uc = uc[8:]
+            return _j.loads(uc.decode("utf-8", errors="replace"))
+        except Exception:
+            return None
+
+    _exif_cls = _classification_from_exif(src_local) or {}
+    _is_interior = _exif_cls.get("isInterior")
+    _source = "exif"
+    if _is_interior is None:
+        _is_interior = req.get("isInterior")
+        _source = "request" if _is_interior is not None else None
+    if _is_interior is True:
+        return {"id": rid, "status": "skipped",
+                "reason": "interior_frame",
+                "isInterior": True, "source": _source}
+    if _is_interior is None:
+        return {"id": rid, "status": "skipped",
+                "reason": "classification_unknown",
+                "note": "no EXIF UserComment classification AND no isInterior in request"}
+
+    # Deterministic per-frame seed for plate-fit randomization (extra
+    # zoom + paired XY offset). Same frame always gets same composite;
+    # different frames in the same shoot get different views of the
+    # plate. Horizontal flip is NOT seed-driven — see flip_plate below.
+    seed_basis = (req.get("imageReviewId") or req.get("stem")
+                  or req.get("sourceR2Path") or rid)
+    import hashlib as _h
+    plate_seed = int.from_bytes(_h.sha256(str(seed_basis).encode()).digest()[:4], "big")
+
+    # Horizontal flip is driven by exterior-subtype (front vs rear of
+    # house) from the producer. Same perspective → same flip. The
+    # producer (worker.py auto-hook or a manual enqueue script) reads
+    # ImageReview.exteriorSubType and sets flipPlate accordingly.
+    flip_plate = bool(req.get("flipPlate", False))
+
+    # Vertical extent: fraction of source height the plate occupies,
+    # anchored at the top. 0.5 (default) aligns the plate's horizon
+    # gradient with the natural horizon line of a real-estate exterior.
+    vertical_extent = float(req.get("verticalExtent", 0.5))
+
     try:
-        alpha, result = run_v9(src, plate)
+        alpha, result = run_v9(src, plate, plate_seed=plate_seed,
+                               flip_plate=flip_plate,
+                               vertical_extent=vertical_extent)
     except Exception as e:
         return {"id": rid, "status": "error", "error": f"v9: {e}"}
 
