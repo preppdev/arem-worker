@@ -867,16 +867,20 @@ def process_job(job: dict) -> dict:
     )
     sort_order_start = (makeup.get("nextSortOrder") or 1) if makeup else 1
 
-    # Single-frame recovery (per-frame orphan recovery): the claim endpoint
-    # returns the chosen stems + the parent's next sortOrder. We develop ONLY
-    # those frames as singles and append them to this job's outputs.
-    single_recovery_stems: set[str] = {
-        s.strip() for s in str(job.get("singleRecoveryStems") or "").split(",") if s.strip()
-    }
+    # Single-frame recovery (per-frame orphan recovery): a make-up child job
+    # whose envelope also carries `singleStems`. We develop ONLY those stems as
+    # singles and append them to the PARENT (effective_job_id + nextSortOrder
+    # already routed via the make-up envelope above), so the parent's output /
+    # watchdog state are untouched. skip_mid_stems never contains orphans (they
+    # were never processed), so they aren't filtered out.
+    single_recovery_stems: set[str] = (
+        {s.strip() for s in str(makeup.get("singleStems") or "").split(",") if s.strip()}
+        if makeup else set()
+    )
     if single_recovery_stems:
-        sort_order_start = job.get("singleRecoveryNextSortOrder") or sort_order_start
         log(f"  single-frame recovery: {len(single_recovery_stems)} stem(s) "
-            f"({', '.join(sorted(single_recovery_stems))}); sortOrderStart={sort_order_start}")
+            f"({', '.join(sorted(single_recovery_stems))}) → parent {effective_job_id}; "
+            f"sortOrderStart={sort_order_start}")
 
     work = WORK_ROOT / job_id
     raw_dir = work / "raws"
