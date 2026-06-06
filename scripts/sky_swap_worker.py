@@ -61,9 +61,30 @@ RES_PREFIX = "sky-swap-jobs/results"
 CTRL_PREFIX = "sky-swap-jobs/control"
 START_TS = time.time()
 
+DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "https://arem-editing-dashboard.vercel.app").rstrip("/")
+WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
+
 
 def log(m: str) -> None:
     print(m, flush=True)
+
+
+def post_stream_event(payload: dict) -> None:
+    """Best-effort: tell the dashboard's master photo stream a swap was made,
+    so it shows on the /photo-stream wall. Served from the Dropbox file."""
+    if not WORKER_TOKEN:
+        return
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            f"{DASHBOARD_URL}/api/internal/stream-event",
+            data=json.dumps(payload).encode(),
+            method="POST",
+            headers={"Content-Type": "application/json", "x-worker-token": WORKER_TOKEN},
+        )
+        urllib.request.urlopen(req, timeout=15).read()
+    except Exception as e:
+        log(f"[skyswap] stream-event post failed: {e}")
 
 
 def rclone(args: list[str], timeout: int = 180) -> subprocess.CompletedProcess:
@@ -290,6 +311,14 @@ def process(req: dict, scratch: Path) -> dict:
     if dbx_root:
         dropbox_full_path = f"{dbx_root}/{dbx_sub}/{stem}.jpg"
         dropbox_ok = upload_to_dropbox(op, dropbox_full_path)
+        if dropbox_ok:
+            post_stream_event({
+                "kind": "skyswap",
+                "jobId": req.get("jobId"),
+                "label": stem,
+                "dropboxPath": dropbox_full_path,
+                "meta": {"alphaCoverage": float((alpha > 0.5).mean())},
+            })
 
     return {
         "id": rid,
