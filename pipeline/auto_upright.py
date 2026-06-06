@@ -300,8 +300,6 @@ def _to_bytes(s: str) -> bytes:
 def build_exif_dict(arw_meta: dict, year: int) -> bytes:
     """Construct an EXIF byte blob with our branding + preserved camera info."""
     zeroth = {
-        piexif.ImageIFD.Make:           _to_bytes(arw_meta.get("Make") or "Sony"),
-        piexif.ImageIFD.Model:          _to_bytes(arw_meta.get("Model") or ""),
         piexif.ImageIFD.Software:       _to_bytes(SOFTWARE),
         piexif.ImageIFD.Artist:         _to_bytes(ARTIST),
         piexif.ImageIFD.Copyright:      _to_bytes(COPYRIGHT_TEMPLATE.format(year=year)),
@@ -309,6 +307,13 @@ def build_exif_dict(arw_meta: dict, year: int) -> bytes:
         piexif.ImageIFD.YResolution:    (300, 1),
         piexif.ImageIFD.ResolutionUnit: 2,  # inches
     }
+    # Camera make/model: write only what the RAW actually reports — never
+    # guess. (Previously Make defaulted to "Sony", mis-labeling Nikon/Canon
+    # shoots whenever camera metadata was unavailable.)
+    if arw_meta.get("Make"):
+        zeroth[piexif.ImageIFD.Make] = _to_bytes(arw_meta["Make"])
+    if arw_meta.get("Model"):
+        zeroth[piexif.ImageIFD.Model] = _to_bytes(arw_meta["Model"])
     dt = arw_meta.get("DateTimeOriginal")
     if dt:
         zeroth[piexif.ImageIFD.DateTime] = _to_bytes(dt)

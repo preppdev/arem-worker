@@ -197,7 +197,8 @@ def decontaminate_spill(image_bgr, alpha, sky_color_bgr, strength=1.0,
 
 
 def fit_plate(plate_bgr, target_h, target_w, seed=None, flip=False,
-              zoom_range=(1.10, 1.30), vertical_extent=0.5):
+              zoom_range=(1.10, 1.30), rotation_range_deg=(0.0, 0.0),
+              vertical_extent=0.5):
     """Fit plate to target dimensions.
 
     `vertical_extent` (default 0.5): fraction of `target_h` that the plate
@@ -234,15 +235,45 @@ def fit_plate(plate_bgr, target_h, target_w, seed=None, flip=False,
         extra_zoom = 1.0
         ox_frac = 0.0
         oy_frac = 0.0
+        rot_deg = 0.0
     else:
+        import os as _os
         import random as _r
         rnd = _r.Random(int(seed) & 0xFFFFFFFF)
         extra_zoom = rnd.uniform(zoom_range[0], zoom_range[1])
         ox_frac = rnd.uniform(-0.5, 0.5)
         oy_frac = rnd.uniform(-0.5, 0.5)
+        _rot_lo = float(_os.environ.get("SKY_V9_PLATE_ROT_LO_DEG", str(rotation_range_deg[0])))
+        _rot_hi = float(_os.environ.get("SKY_V9_PLATE_ROT_HI_DEG", str(rotation_range_deg[1])))
+        rot_deg = rnd.uniform(_rot_lo, _rot_hi)
 
     if flip:
         plate_bgr = plate_bgr[:, ::-1].copy()
+
+    # Step 0: rotate the plate around its center by `rot_deg`. DISABLED BY
+    # DEFAULT (rotation_range_deg=(0,0)) — the ±25° rotation was the root
+    # cause of the "abstract art" smears: on any plate that carries a
+    # horizon/landscape band, rotating it tilts that band into a steep
+    # diagonal and BORDER_REPLICATE drags it as parallel streaks across
+    # the source's sky region. Per-frame variety already comes from the
+    # zoom + XY pan below. Only re-enable via SKY_V9_PLATE_ROT_*_DEG if
+    # you have proven the plate set is 100% sky-only, and keep it small.
+    # Border mode is REPLICATE (not REFLECT) so a re-enabled rotation
+    # extends edge pixels instead of mirroring plate content inward.
+    if abs(rot_deg) > 0.05:
+        ph0, pw0 = plate_bgr.shape[:2]
+        M = cv2.getRotationMatrix2D((pw0 / 2.0, ph0 / 2.0), rot_deg, 1.0)
+        cos = abs(M[0, 0]); sin = abs(M[0, 1])
+        new_w = int(round(ph0 * sin + pw0 * cos))
+        new_h = int(round(ph0 * cos + pw0 * sin))
+        M[0, 2] += new_w / 2.0 - pw0 / 2.0
+        M[1, 2] += new_h / 2.0 - ph0 / 2.0
+        plate_bgr = cv2.warpAffine(
+            plate_bgr, M, (new_w, new_h),
+            flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REPLICATE)
+        ph, pw = plate_bgr.shape[:2]
+        plate_aspect = pw / ph
+        fit_aspect = fit_w / fit_h
 
     # Step 1: cover-fit to the plate's TARGET ROW BAND (fit_w × fit_h)
     if plate_aspect > fit_aspect:
@@ -281,38 +312,59 @@ def fit_plate(plate_bgr, target_h, target_w, seed=None, flip=False,
 
 
 def match_plate_luminance(plate_bgr, src_bgr, alpha, *,
-                          min_alpha=0.95, min_shift=10.0, strength=1.0):
-    """L-channel match: shift plate's mean L (Lab) toward the source's
-    existing sky-region mean L, leaving a/b (chroma) untouched. This is
-    "variant E" from the plate-matching study — fixes the dominant
-    brightness clash between a saturated stock plate and the source's
-    actual scene illumination, without disturbing the plate's color
-    character.
+                          min_alpha=0.85, min_shift=0.0, strength=1.0,
+                          std_strength=0.5, ab_strength=0.0):
+    """Match plate to source sky in Lab space.
 
-    Skips the adjustment when:
-      - fewer than 100 source pixels reach alpha >= min_alpha
-        (not enough sky to sample reliably)
-      - the would-be shift is below min_shift L units
-        (plate already roughly matches; nothing to do)
+    L channel: shift mean (full strength) and scale variance toward the
+    source distribution at `std_strength` (default 0.5 — partial so a
+    clean plate doesn't get stretched into noise). This is the dominant
+    brightness fix.
+
+    a/b channels: shift mean at `ab_strength` (default 0.0 — disabled to
+    preserve the plate's blue character). Set via env if a particular
+    shoot's sky has a tint that doesn't match the plate pack.
+
+    Sky samples: alpha >= `min_alpha` (default 0.85 — looser than v1's
+    0.95 to get a usable sample on tight-canopy frames where the
+    high-confidence sky region is small).
     """
     import os as _os
     if _os.environ.get("SKY_V9_PLATE_LUMA_MATCH", "1").lower() not in ("1", "true", "yes"):
         return plate_bgr
-    _strength = float(_os.environ.get("SKY_V9_PLATE_LUMA_STRENGTH", str(strength)))
-    _min_shift = float(_os.environ.get("SKY_V9_PLATE_LUMA_MIN_SHIFT", str(min_shift)))
-    _min_alpha = float(_os.environ.get("SKY_V9_PLATE_LUMA_MIN_ALPHA", str(min_alpha)))
+    _str       = float(_os.environ.get("SKY_V9_PLATE_LUMA_STRENGTH",     str(strength)))
+    _min_shift = float(_os.environ.get("SKY_V9_PLATE_LUMA_MIN_SHIFT",    str(min_shift)))
+    _min_alpha = float(_os.environ.get("SKY_V9_PLATE_LUMA_MIN_ALPHA",    str(min_alpha)))
+    _std_str   = float(_os.environ.get("SKY_V9_PLATE_LUMA_STD_STRENGTH", str(std_strength)))
+    _ab_str    = float(_os.environ.get("SKY_V9_PLATE_LUMA_AB_STRENGTH",  str(ab_strength)))
 
     sky_mask = alpha >= _min_alpha
     if int(sky_mask.sum()) < 100:
         return plate_bgr
-    src_l = cv2.cvtColor(src_bgr, cv2.COLOR_BGR2LAB)[..., 0].astype(np.float32)
-    src_l_mean = float(src_l[sky_mask].mean())
+    src_lab = cv2.cvtColor(src_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
     plate_lab = cv2.cvtColor(plate_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-    plate_l_mean = float(plate_lab[..., 0].mean())
-    delta = (src_l_mean - plate_l_mean) * _strength
-    if abs(delta) < _min_shift:
-        return plate_bgr
-    plate_lab[..., 0] = np.clip(plate_lab[..., 0] + delta, 0, 255)
+
+    src_l = src_lab[..., 0][sky_mask]
+    src_l_mean = float(src_l.mean()); src_l_std = float(src_l.std())
+    plate_l = plate_lab[..., 0]
+    plate_l_mean = float(plate_l.mean()); plate_l_std = float(plate_l.std() + 1e-6)
+
+    delta = (src_l_mean - plate_l_mean) * _str
+    if abs(delta) >= _min_shift:
+        # Scale variance toward source, then shift mean. Scale factor is
+        # blended toward 1.0 at (1 - std_strength) so std_strength=0
+        # leaves variance unchanged.
+        scale = 1.0 + _std_str * (src_l_std / plate_l_std - 1.0)
+        new_l = (plate_l - plate_l_mean) * scale + plate_l_mean + delta
+        plate_lab[..., 0] = np.clip(new_l, 0, 255)
+
+    if _ab_str > 0.0:
+        for ch in (1, 2):
+            src_c_mean = float(src_lab[..., ch][sky_mask].mean())
+            plate_c_mean = float(plate_lab[..., ch].mean())
+            shift = (src_c_mean - plate_c_mean) * _ab_str
+            plate_lab[..., ch] = np.clip(plate_lab[..., ch] + shift, 0, 255)
+
     return cv2.cvtColor(plate_lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
 
 
@@ -325,6 +377,67 @@ def composite(plate, src_decontam, alpha):
 def alpha_to_rgb(a):
     g = (np.clip(a, 0, 1) * 255).astype(np.uint8)
     return cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
+
+
+def enforce_top_edge_sky(coarse, *, top_band_frac=0.02, dilate_px=16,
+                          erode_before_cc_px=12):
+    # Real outdoor sky must be reachable from the top edge through
+    # connected sky pixels. Window reflections, glass tabletops, and
+    # other indoor sky-impostors are always enclosed by structure.
+    # We erode the binary mask before connectivity analysis so a thin
+    # bridge of stray sky-tagged pixels through e.g. a porch ceiling
+    # doesn't keep an enclosed window glued to the top-sky region.
+    import os as _os
+    if _os.environ.get("SKY_V9_TOP_EDGE", "1").lower() not in ("1","true","yes"):
+        return coarse
+    _band  = float(_os.environ.get("SKY_V9_TOP_EDGE_BAND_FRAC", str(top_band_frac)))
+    _dil   = int(_os.environ.get("SKY_V9_TOP_EDGE_DILATE", str(dilate_px)))
+    _erode = int(_os.environ.get("SKY_V9_TOP_EDGE_ERODE", str(erode_before_cc_px)))
+    h, w = coarse.shape
+    binary = (coarse > 0.5).astype(np.uint8)
+    if binary.sum() == 0:
+        return coarse
+    # Erode so thin/weak bridges (porch ceiling stragglers, single-pixel
+    # connectors) don't merge structurally separate regions.
+    if _erode > 0:
+        kern_e = np.ones((_erode, _erode), np.uint8)
+        eroded = cv2.erode(binary, kern_e, iterations=1)
+    else:
+        eroded = binary
+    if eroded.sum() == 0:
+        return np.zeros_like(coarse)
+    n_lab, labels = cv2.connectedComponents(eroded, connectivity=8)
+    top_band = max(1, int(h * _band))
+    top_labels = np.unique(labels[:top_band, :])
+    keep_set = {int(l) for l in top_labels if int(l) != 0}
+    if not keep_set:
+        return np.zeros_like(coarse)
+    keep = np.isin(labels, list(keep_set)).astype(np.uint8)
+    # Re-grow: undo the erosion plus the soft-fringe margin
+    regrow = _erode + max(0, _dil)
+    if regrow > 0:
+        kern_d = np.ones((regrow, regrow), np.uint8)
+        keep = cv2.dilate(keep, kern_d, iterations=1)
+    out = coarse.copy()
+    out[keep == 0] = 0.0
+    return out
+
+
+def dark_suppress_alpha(alpha, src_bgr, *, v_low=60, v_high=140, strength=1.0):
+    # Cap alpha by HSV V — dark pixels (V<v_low) get alpha ~0, bright
+    # pixels (V>v_high) untouched. Physical: real sky is never near-black,
+    # so deep shadows tagged as sky are matting / segmenter mistakes.
+    import os as _os
+    if _os.environ.get("SKY_V9_DARK_SUPPRESS", "1").lower() not in ("1","true","yes"):
+        return alpha
+    _vl  = float(_os.environ.get("SKY_V9_DARK_SUPPRESS_V_LOW",  str(v_low)))
+    _vh  = float(_os.environ.get("SKY_V9_DARK_SUPPRESS_V_HIGH", str(v_high)))
+    _str = float(_os.environ.get("SKY_V9_DARK_SUPPRESS_STRENGTH", str(strength)))
+    hsv = cv2.cvtColor(src_bgr, cv2.COLOR_BGR2HSV)
+    V = hsv[..., 2].astype(np.float32)
+    cap = np.clip((V - _vl) / max(1.0, _vh - _vl), 0.0, 1.0)
+    cap_eff = 1.0 - _str * (1.0 - cap)
+    return np.clip(alpha * cap_eff, 0, 1).astype(np.float32)
 
 
 def run_v9(src, plate, plate_seed=None, flip_plate=False,
@@ -369,11 +482,43 @@ def run_v9(src, plate, plate_seed=None, flip_plate=False,
             f"sky mass not in top half ({_top_frac:.2f} < {_min_top:.2f}) — "
             f"likely a window/skylight/fixture, not exterior sky"
         )
+    # Drop coarse-sky components not connected to the top edge of the
+    # image. Catches window-reflection false positives where the segmenter
+    # tags blue-ish glass as sky despite it being enclosed by structure.
+    coarse = enforce_top_edge_sky(coarse)
+    if not (coarse > 0.5).any():
+        raise RuntimeError(
+            "no sky region reaches the top edge — likely window "
+            "reflections / enclosed glass, refusing to composite"
+        )
     trimap = build_trimap(coarse)
-    alpha_raw = closed_form_matting(src, trimap)
+    try:
+        alpha_raw = closed_form_matting(src, trimap)
+    except Exception as _matte_err:
+        # pymatting rejects the trimap ("did not contain foreground
+        # values") or fails its incomplete-Cholesky preconditioner on
+        # thin / low-contrast sky. We've already cleared the coverage +
+        # top-edge guards above, so there IS real sky here -- rather than
+        # drop the frame, fall back to a guided-filter matte off the
+        # coarse (top-edge-enforced) segmentation. Softer edges, but a
+        # usable QC composite instead of a hard skip.
+        import sys as _sys
+        print("[v9] closed-form matting failed (%s); falling back to "
+              "guided coarse alpha" % _matte_err, file=_sys.stderr)
+        _guide = cv2.cvtColor(src, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+        alpha_raw = _guided_filter(_guide,
+                                   np.clip(coarse, 0.0, 1.0).astype(np.float32),
+                                   r=8, eps=1e-6)
+        alpha_raw = np.clip(alpha_raw, 0.0, 1.0).astype(np.float32)
     alpha_sharp, grad = edge_aware_sharpen(src, alpha_raw)
     alpha_exp = expand_by_sky_color(src, alpha_sharp, grad)
     alpha = demote_islands(alpha_exp)
+    # Re-enforce top-edge connectivity on the post-expansion alpha. The
+    # expand step can paint window glass / glass-tabletop sky-blue because
+    # it color-matches the sampled sky — drop any α>0.5 component that
+    # doesn't reach the top band.
+    alpha = enforce_top_edge_sky(alpha, dilate_px=0)
+    alpha = dark_suppress_alpha(alpha, src)
     sky_bgr = estimate_sky_color(src, alpha)
     src_clean = decontaminate_spill(src, alpha, sky_bgr)
     # Match the plate's brightness to the source's existing sky so the

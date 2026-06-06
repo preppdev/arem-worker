@@ -409,11 +409,14 @@ def run_upright(pred_dir: Path, upright_root: Path, raw_dir: Path) -> Path:
     if arw_layout.exists():
         shutil.rmtree(arw_layout, ignore_errors=True)
     arw_layout.mkdir(parents=True, exist_ok=True)
-    # Symlink every input image (ARW or standard format) so auto_upright
-    # can find the source for EXIF-passthrough. exifread reads EXIF from
-    # ARW + JPG + TIFF identically.
-    for ext in ("ARW", "arw", "JPG", "jpg", "JPEG", "jpeg",
-                "TIF", "tif", "TIFF", "tiff", "JXL", "jxl"):
+    # Symlink every input image so auto_upright can find the source for
+    # EXIF-passthrough. Use the SAME ACCEPTED_EXTS we download — exifread
+    # reads EXIF from ARW / NEF / CR2 / CR3 / DNG / RAF / RW2 / JPG / TIFF
+    # identically. (Previously this loop hardcoded only ARW + standard
+    # formats, so non-Sony RAW shoots (e.g. Nikon NEF) were downloaded but
+    # never symlinked here → arw_meta came back empty → camera EXIF dropped
+    # and Make mis-stamped "Sony".)
+    for ext in ACCEPTED_EXTS:
         for src in raw_dir.glob(f"*.{ext}"):
             try:
                 (arw_layout / src.name).symlink_to(src)
@@ -668,6 +671,16 @@ def _enqueue_sky_swap_for_shoot(
     # classification POST has already created the rows, but we don't have
     # ids handy here; the daemon can update by jobId+midStem if needed,
     # which we include).
+    # dropbox_path is a full rclone remote path ("dropbox:AREM (Spiro
+    # Uploads)/...") used directly by download_raws / upload_outputs.
+    # The sky-swap request contract wants the BARE Dropbox path -- the
+    # sky-swap worker prepends the remote itself -- so strip the
+    # "<remote>:" prefix here to avoid a "dropbox:dropbox:" double prefix.
+    _dbx_job_path = dropbox_path
+    _remote_pfx = f"{RCLONE_REMOTE}:"
+    if _dbx_job_path.startswith(_remote_pfx):
+        _dbx_job_path = _dbx_job_path[len(_remote_pfx):]
+
     enqueued = 0
     for rec in exterior_recs:
         stem = rec["midStem"]
@@ -682,7 +695,7 @@ def _enqueue_sky_swap_for_shoot(
             "plateBucket": "arem-training-data",
             "plateR2Path": plate["r2Path"],
             "skyImageId": plate["id"],
-            "dropboxJobPath": dropbox_path,
+            "dropboxJobPath": _dbx_job_path,
             "dropboxSubfolder": "08-Test-Edit/sky-swap",
             "stem": stem,
             "jobId": job_id,
@@ -901,6 +914,17 @@ def process_job(job: dict) -> dict:
         output_prefix = manual.get("outputPrefix") or f"manual_uploads/{job_id}/outputs/"
         log(f"  [4/4] uploading outputs to R2 ({output_prefix})")
         n_jpg, output_keys = upload_manual_outputs(upright_dir, output_prefix)
+        # Deliver the finished JPGs to the Manual Jobs Dropbox folder for
+        # operator pickup -- the in-dashboard download path isn't wired for
+        # manual uploads. Best-effort; never fails the job.
+        _mfolder = (job.get("jobFolderName") or job_id).replace("/", "_")
+        _mdst = f"{RCLONE_REMOTE}:AREM (Spiro Uploads)/Manual Jobs/{_mfolder}"
+        try:
+            _mr = rclone(["copy", str(upright_dir), _mdst, "--include", "*.jpg",
+                          "--transfers", "8", "--progress=false"], timeout=900)
+            log(f"    manual Dropbox delivery: rc={_mr.returncode} -> {_mdst}")
+        except Exception as _me:
+            log(f"  WARN manual Dropbox delivery: {str(_me)[:200]}")
         production_records: list[dict] = []
     else:
         log(f"  [4/4] uploading to {DROPBOX_OUTPUT_FOLDER}")
