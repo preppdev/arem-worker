@@ -350,7 +350,8 @@ def download_raws(dropbox_remote_path: str, local_raw_dir: Path) -> tuple[int, i
 
 def run_inference(local_raw_dir: Path, pred_root: Path,
                   polish_ckpts: dict[str, Path | None] | None = None,
-                  skip_mid_stems: set[str] | None = None) -> Path:
+                  skip_mid_stems: set[str] | None = None,
+                  single_stems: set[str] | None = None) -> Path:
     """Run the canonical Stage 1 (NAFNet) + Stage 2 (NAFNet routed) +
     Stage 3 (NAFNet polish, optional) pipeline.
 
@@ -382,6 +383,10 @@ def run_inference(local_raw_dir: Path, pred_root: Path,
     # Make-up skip set. Comma-separated to match the CLI flag's parsing.
     if skip_mid_stems:
         cmd += ["--skip-mid-stems", ",".join(sorted(skip_mid_stems))]
+    # Single-frame recovery: develop ONLY these stems as singles (no
+    # bracketing) — the per-frame orphan-recovery path.
+    if single_stems:
+        cmd += ["--single-stems", ",".join(sorted(single_stems))]
     # CHECKPOINT_STAGE1 / CHECKPOINT_INTERIOR / CHECKPOINT_EXTERIOR /
     # CLASSIFIER_PATH come from the environment (Dockerfile defaults).
     log(f"  inference: {' '.join(cmd)}")
@@ -862,6 +867,17 @@ def process_job(job: dict) -> dict:
     )
     sort_order_start = (makeup.get("nextSortOrder") or 1) if makeup else 1
 
+    # Single-frame recovery (per-frame orphan recovery): the claim endpoint
+    # returns the chosen stems + the parent's next sortOrder. We develop ONLY
+    # those frames as singles and append them to this job's outputs.
+    single_recovery_stems: set[str] = {
+        s.strip() for s in str(job.get("singleRecoveryStems") or "").split(",") if s.strip()
+    }
+    if single_recovery_stems:
+        sort_order_start = job.get("singleRecoveryNextSortOrder") or sort_order_start
+        log(f"  single-frame recovery: {len(single_recovery_stems)} stem(s) "
+            f"({', '.join(sorted(single_recovery_stems))}); sortOrderStart={sort_order_start}")
+
     work = WORK_ROOT / job_id
     raw_dir = work / "raws"
     pred_root = work / "predictions"
@@ -905,7 +921,8 @@ def process_job(job: dict) -> dict:
     polish_ckpts = resolve_polish_ckpts(job.get("polishStyle"))
     pred_dir = run_inference(raw_dir, pred_root,
                              polish_ckpts=polish_ckpts,
-                             skip_mid_stems=skip_mid_stems)
+                             skip_mid_stems=skip_mid_stems,
+                             single_stems=single_recovery_stems)
 
     log("  [3/4] auto-upright + EXIF/branding")
     upright_dir = run_upright(pred_dir, upright_root, raw_dir)
@@ -962,6 +979,7 @@ def process_job(job: dict) -> dict:
     # issue. Peak VRAM tells us how much sensor-resolution headroom we have.
     import json as _json
     grouping_warnings: list[dict] = []
+    orphan_frames: list[dict] = []
     peak_vram_gb: float | None = None
     gpu_total_gb: float | None = None
     n_triplets: int = 0
@@ -970,6 +988,10 @@ def process_job(job: dict) -> dict:
         try:
             meta = _json.loads(meta_path.read_text())
             grouping_warnings = meta.get("group_failures", []) or []
+            # RAWs not used in any bracket — the single-frame-recovery
+            # candidates the dashboard surfaces. Suppressed on a recovery
+            # run (it processes a chosen subset, not a full bracket pass).
+            orphan_frames = meta.get("orphanFrames", []) or []
             peak_vram_gb = meta.get("peak_vram_gb")
             gpu_total_gb = meta.get("gpu_total_gb")
             n_triplets = int(meta.get("n_triplets") or 0)
@@ -1304,6 +1326,7 @@ def process_job(job: dict) -> dict:
             else f"{stored_path}/{DROPBOX_OUTPUT_FOLDER}"
         ),
         "groupingWarnings": grouping_warnings,
+        "orphanFrames": orphan_frames,
         "peakVramGb": peak_vram_gb,
         "gpuTotalGb": gpu_total_gb,
     }
