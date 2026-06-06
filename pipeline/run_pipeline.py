@@ -867,7 +867,8 @@ def process_shoot(raw_dir: Path, out_dir: Path,
                   clf_ckpt: Path,
                   polish_int_ckpt: Path | None = None,
                   polish_ext_ckpt: Path | None = None,
-                  skip_mid_stems: set[str] | None = None) -> dict:
+                  skip_mid_stems: set[str] | None = None,
+                  single_stems: set[str] | None = None) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     s1_dir = out_dir / "stage1"
     s2_dir = out_dir / "stage2"
@@ -903,8 +904,32 @@ def process_shoot(raw_dir: Path, out_dir: Path,
     db = lensfunpy.Database()
 
     arws = list_arws(raw_dir)
-    triplets, group_failures = find_triplets(arws)
-    print(f"\n{raw_dir}: {len(arws)} ARWs → {len(triplets)} triplets", flush=True)
+    single_stems = single_stems or set()
+    orphan_frames: list[dict] = []
+    if single_stems:
+        # Single-frame recovery (alternative Stage 1): develop exactly the
+        # requested frames as singles, no bracketing. Used by the per-frame
+        # orphan-recovery action.
+        by_stem = {a.stem: a for a in arws}
+        singles = [by_stem[s] for s in sorted(single_stems) if s in by_stem]
+        not_found = sorted(s for s in single_stems if s not in by_stem)
+        triplets, group_failures = [], []
+        print(f"\n{raw_dir}: single-frame recovery — {len(singles)}/{len(single_stems)} "
+              f"frame(s){' (not found: ' + ', '.join(not_found) + ')' if not_found else ''}",
+              flush=True)
+    else:
+        triplets, group_failures = find_triplets(arws)
+        singles = []
+        print(f"\n{raw_dir}: {len(arws)} ARWs → {len(triplets)} triplets", flush=True)
+        # Orphan capture: RAWs not consumed by any triplet — the candidates
+        # the dashboard surfaces for single-frame recovery.
+        used = {f.stem for (u, m, o) in triplets for f in (u, m, o)}
+        orphan_frames = [{"stem": a.stem, "name": a.name}
+                         for a in arws if a.stem not in used]
+        if orphan_frames:
+            print(f"  {len(orphan_frames)} orphan frame(s) (not in any bracket): "
+                  f"{', '.join(o['stem'] for o in orphan_frames[:12])}"
+                  f"{' …' if len(orphan_frames) > 12 else ''}", flush=True)
 
     # Makeup-job optimization: the worker passes skip_mid_stems for the
     # midStems that the parent already has finished JPGs for. Drop them
@@ -939,6 +964,9 @@ def process_shoot(raw_dir: Path, out_dir: Path,
     meta = {"raw_dir": str(raw_dir), "n_arws": len(arws),
             "n_triplets": len(triplets), "triplets": [],
             "group_failures": group_failures,
+            "orphanFrames": orphan_frames,
+            "n_singles": len(singles),
+            "single_recovery": bool(single_stems),
             "skipped_stems": sorted(skip_mid_stems) if skip_mid_stems else []}
     n_int = n_ext = 0
     grand_t0 = time.time()
@@ -948,6 +976,110 @@ def process_shoot(raw_dir: Path, out_dir: Path,
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
+    # Shared per-image downstream: classify → Stage 2 → Stage 3 → room →
+    # EXIF → thumbnail → meta. Called by BOTH the triplet path (s1_out from
+    # the Stage-1 HDR net) and the single-frame path (s1_out = the developed
+    # RAW). Identical logic for both — only how s1_out is produced differs.
+    def finish_image(idx, total, stem, s1_out, t0, t_demos, t_s1,
+                     under, mid, over, single, lens_info):
+        nonlocal n_int, n_ext
+        tag = f"[{'single ' if single else ''}{idx}/{total}]"
+        s1_path = s1_dir / f"{stem}_stage1.jpg"
+        Image.fromarray(s1_out).save(s1_path, quality=95)
+
+        is_int, conf, label = classify(clf, label_names, clf_tfm, s1_path, device)
+        t_clf = time.time()
+        route = "int" if is_int else "ext"
+
+        s2_path = s2_dir / f"{stem}_stage2-{route}.jpg"
+        try:
+            stage2_infer(s2_int if is_int else s2_ext, s1_path, s2_path, device)
+        except Exception as e:
+            print(f"  {tag} {stem}: stage2 fail: {e}", flush=True)
+            traceback.print_exc()
+            meta["triplets"].append({"stem": stem, "skip": f"stage2_fail:{e}",
+                                      "route": route, "conf": conf, "single": single})
+            return
+        t_s2 = time.time()
+
+        # ── Stage 3 (polish) — overwrites the Stage 2 file in place. ───────
+        s3_model = s3_int if is_int else s3_ext
+        s3_variant = s3_int_variant if is_int else s3_ext_variant
+        applied_stage3_variant: str | None = None
+        if s3_model is not None:
+            s3_path = s2_dir / f"{stem}_stage3-{route}.jpg"
+            try:
+                stage3_infer(s3_model, s2_path, s3_path, device)
+                s3_path.replace(s2_path)
+                applied_stage3_variant = s3_variant
+            except Exception as e:
+                print(f"  {tag} {stem}: stage3 fail (continuing with stage2 output): {e}", flush=True)
+                traceback.print_exc()
+                s3_path.unlink(missing_ok=True)
+        t_s3 = time.time()
+
+        if is_int: n_int += 1
+        else: n_ext += 1
+
+        room = classify_room(room_model, s2_path, device)
+        t_room = time.time()
+
+        cls_payload = {
+            "isInterior": bool(is_int),
+            "interiorClassifier": "classifier_v2",
+            "interiorConfidence": round(conf, 4),
+            "roomType": (room or {}).get("roomType"),
+            "roomConfidence": round((room or {}).get("roomConfidence") or 0.0, 4) if room else None,
+            "occupancy": (room or {}).get("occupancy"),
+            "stage3Variant": applied_stage3_variant,
+            "modelVersions": {
+                # Single frames skip the HDR net — record that for provenance.
+                "stage1": "single-develop" if single else stage1_ckpt.name,
+                "stage2": (int_ckpt if is_int else ext_ckpt).name,
+                "stage3": (polish_int_ckpt.name if is_int else polish_ext_ckpt.name)
+                           if applied_stage3_variant else None,
+                "interior_classifier": clf_ckpt.name,
+                "room_classifier": (room or {}).get("version"),
+            },
+            "classifiedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        embed_classification_exif(s2_path, cls_payload)
+
+        thumb_dir = out_dir / "_thumbnails"
+        thumb_path = thumb_dir / f"{stem}.jpg"
+        try:
+            make_thumbnail(s2_path, thumb_path)
+        except Exception as e:
+            print(f"  {tag} {stem}: thumbnail fail: {e}", flush=True)
+            thumb_path = None  # type: ignore
+
+        meta["triplets"].append({
+            "stem": stem,
+            "under": under.name, "mid": mid.name, "over": over.name,
+            "single": single,
+            "lens_applied": lens_info["applied"], "lens_skip": lens_info.get("skip_reason"),
+            "route": route, "confidence": round(conf, 3),
+            "stage1_path": str(s1_path.relative_to(out_dir)),
+            "stage2_path": str(s2_path.relative_to(out_dir)),
+            "stage1_size": list(s1_out.shape[:2]),
+            "classification": cls_payload,
+            "thumbnail_path": (str(thumb_path.relative_to(out_dir)) if thumb_path else None),
+            "timing_s": {
+                "demos": round(t_demos - t0, 2),
+                "s1": round(t_s1 - t_demos, 2),
+                "clf": round(t_clf - t_s1, 2),
+                "s2": round(t_s2 - t_clf, 2),
+                "s3": round(t_s3 - t_s2, 2),
+                "room": round(t_room - t_s3, 2),
+                "total": round(t_room - t0, 2),
+            },
+        })
+        s3_log = f" s3={t_s3-t_s2:.1f}s" if applied_stage3_variant else ""
+        print(f"  {tag} {stem} {route} ({conf:.2f}) "
+              f"demos={t_demos-t0:.1f}s s1={t_s1-t_demos:.1f}s "
+              f"s2={t_s2-t_clf:.1f}s{s3_log} tot={t_s3-t0:.1f}s", flush=True)
+
+    # ── Triplet path: Stage-1 HDR fusion of (under, mid, over) ───────────
     for ti, (under, mid, over) in enumerate(triplets, 1):
         stem = mid.stem
         t0 = time.time()
@@ -977,131 +1109,31 @@ def process_shoot(raw_dir: Path, out_dir: Path,
             meta["triplets"].append({"stem": stem, "skip": f"stage1_fail:{e}"})
             continue
         t_s1 = time.time()
+        finish_image(ti, len(triplets), stem, s1_out, t0, t_demos, t_s1,
+                     under, mid, over, single=False, lens_info=ui)
 
-        s1_path = s1_dir / f"{stem}_stage1.jpg"
-        Image.fromarray(s1_out).save(s1_path, quality=95)
-
-        is_int, conf, label = classify(clf, label_names, clf_tfm, s1_path, device)
-        t_clf = time.time()
-        route = "int" if is_int else "ext"
-
-        s2_path = s2_dir / f"{stem}_stage2-{route}.jpg"
+    # ── Single-frame path (alternative Stage 1): develop the one RAW. ────
+    # lens_correct_16 already does WB + lens correction + sRGB gamma
+    # (no_auto_bright), so the only "Stage 1" left is dropping 16→8 bit.
+    for si, frame in enumerate(singles, 1):
+        stem = frame.stem
+        t0 = time.time()
         try:
-            stage2_infer(s2_int if is_int else s2_ext, s1_path, s2_path, device)
-        except Exception as e:
-            print(f"  [{ti}/{len(triplets)}] {stem}: stage2 fail: {e}", flush=True)
-            traceback.print_exc()
-            meta["triplets"].append({"stem": stem, "skip": f"stage2_fail:{e}",
-                                      "route": route, "conf": conf})
+            m16, mi = lens_correct_16(frame, db)
+        except LensExcluded as e:
+            print(f"  [single {si}/{len(singles)}] {stem}: lens excluded — {e}", flush=True)
+            meta["triplets"].append({"stem": stem, "skip": "lens_excluded", "single": True})
             continue
-        t_s2 = time.time()
-
-        # ── Stage 3 (polish) ─────────────────────────────────────────────
-        # Apply the routed polish model if one is configured. Writes a
-        # NEW file (<stem>_stage3-<route>.jpg) and then renames over the
-        # Stage 2 file — downstream (auto_upright, worker rclone upload)
-        # reads from s2_dir/<stem>_stage2-<route>.jpg, so the final
-        # image is always at the same path regardless of whether Stage
-        # 3 ran. stage3Variant is recorded in cls_payload below so the
-        # dashboard tracks which polish was actually applied.
-        s3_model = s3_int if is_int else s3_ext
-        s3_variant = s3_int_variant if is_int else s3_ext_variant
-        applied_stage3_variant: str | None = None
-        if s3_model is not None:
-            s3_path = s2_dir / f"{stem}_stage3-{route}.jpg"
-            try:
-                stage3_infer(s3_model, s2_path, s3_path, device)
-                # Overwrite the Stage 2 file in place so the downstream
-                # auto_upright / Dropbox upload paths don't change.
-                s3_path.replace(s2_path)
-                applied_stage3_variant = s3_variant
-            except Exception as e:
-                # Stage 3 failure should NOT fail the image — we still
-                # have a perfectly good Stage 2 output. Log and continue
-                # with Stage 2 as the final.
-                print(f"  [{ti}/{len(triplets)}] {stem}: stage3 fail (continuing "
-                      f"with stage2 output): {e}", flush=True)
-                traceback.print_exc()
-                s3_path.unlink(missing_ok=True)
-        t_s3 = time.time()
-
-        if is_int: n_int += 1
-        else: n_ext += 1
-
-        # ── Per-image classification + thumbnail (added 2026-05-12) ─────────
-        # Run the room classifier on the Stage-2 output (interior class only
-        # in practice; the model returns null-ish predictions on outdoor
-        # scenes, but we still record them so the dashboard can decide).
-        room = classify_room(room_model, s2_path, device)
-        t_room = time.time()
-
-        # Build the per-image classification payload that will go into
-        # both EXIF and the dashboard POST (worker.py reads from meta).
-        cls_payload = {
-            "isInterior": bool(is_int),
-            "interiorClassifier": "classifier_v2",
-            "interiorConfidence": round(conf, 4),
-            "roomType": (room or {}).get("roomType"),
-            "roomConfidence": round((room or {}).get("roomConfidence") or 0.0, 4) if room else None,
-            "occupancy": (room or {}).get("occupancy"),
-            # stage3Variant: the dirname of the polish ckpt applied to
-            # this image, e.g. "polish_exterior_v1". Null when no polish
-            # ckpt was configured for this image's route OR Stage 3 ran
-            # but errored (we keep the Stage 2 output and don't claim a
-            # polish was applied).
-            "stage3Variant": applied_stage3_variant,
-            "modelVersions": {
-                "stage1": stage1_ckpt.name,
-                "stage2": (int_ckpt if is_int else ext_ckpt).name,
-                "stage3": (polish_int_ckpt.name if is_int else polish_ext_ckpt.name)
-                           if applied_stage3_variant else None,
-                "interior_classifier": clf_ckpt.name,
-                "room_classifier": (room or {}).get("version"),
-            },
-            "classifiedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }
-        embed_classification_exif(s2_path, cls_payload)
-
-        # 512px long-edge thumbnail. Lives in a sibling dir so the rclone
-        # job-output upload doesn't grab it; worker.py uploads thumbs to
-        # R2 separately.
-        thumb_dir = out_dir / "_thumbnails"
-        thumb_path = thumb_dir / f"{stem}.jpg"
-        try:
-            make_thumbnail(s2_path, thumb_path)
         except Exception as e:
-            print(f"  [{ti}/{len(triplets)}] {stem}: thumbnail fail: {e}", flush=True)
-            thumb_path = None  # type: ignore
-
-        meta["triplets"].append({
-            "stem": stem,
-            "under": under.name, "mid": mid.name, "over": over.name,
-            "lens_applied": ui["applied"], "lens_skip": ui.get("skip_reason"),
-            "route": route, "confidence": round(conf, 3),
-            "stage1_path": str(s1_path.relative_to(out_dir)),
-            "stage2_path": str(s2_path.relative_to(out_dir)),
-            "stage1_size": list(s1_out.shape[:2]),
-            # Classification snapshot — consumed by worker.py for the
-            # POST to /api/internal/image-classification and as the
-            # source-of-truth for what the model decided on this frame.
-            "classification": cls_payload,
-            "thumbnail_path": (str(thumb_path.relative_to(out_dir))
-                               if thumb_path else None),
-            "timing_s": {
-                "demos": round(t_demos - t0, 2),
-                "s1": round(t_s1 - t_demos, 2),
-                "clf": round(t_clf - t_s1, 2),
-                "s2": round(t_s2 - t_clf, 2),
-                "s3": round(t_s3 - t_s2, 2),
-                "room": round(t_room - t_s3, 2),
-                "total": round(t_room - t0, 2),
-            },
-        })
-        s3_log = f" s3={t_s3-t_s2:.1f}s" if applied_stage3_variant else ""
-        print(f"  [{ti}/{len(triplets)}] {stem} {route} ({conf:.2f}) "
-              f"demos={t_demos-t0:.1f}s s1={t_s1-t_demos:.1f}s "
-              f"s2={t_s2-t_clf:.1f}s{s3_log} tot={t_s3-t0:.1f}s",
-              flush=True)
+            print(f"  [single {si}/{len(singles)}] {stem}: demosaic fail: {e}", flush=True)
+            meta["triplets"].append({"stem": stem, "skip": f"demosaic_fail:{e}", "single": True})
+            continue
+        t_demos = time.time()
+        m16 = resize_max_mp(m16, MAX_MP)
+        s1_out = (m16 >> 8).astype(np.uint8)  # 16-bit sRGB → 8-bit
+        t_s1 = time.time()
+        finish_image(si, len(singles), stem, s1_out, t0, t_demos, t_s1,
+                     frame, frame, frame, single=True, lens_info=mi)
 
     meta["wall_min"] = round((time.time() - grand_t0) / 60, 1)
     meta["n_int"] = n_int
@@ -1157,8 +1189,14 @@ def main():
                      help="Comma-separated midStems to skip in the "
                           "inference loop (used by make-up jobs to avoid "
                           "redoing already-finished triplets).")
+    ap.add_argument("--single-stems", type=str, default="",
+                     help="Comma-separated stems to develop as SINGLE frames "
+                          "(alternative Stage 1 — no bracketing). When set, "
+                          "ONLY these frames are processed (single-frame "
+                          "orphan recovery).")
     args = ap.parse_args()
     skip_set = {s.strip() for s in args.skip_mid_stems.split(",") if s.strip()}
+    single_set = {s.strip() for s in args.single_stems.split(",") if s.strip()}
 
     # Env fallbacks for polish ckpts — used when worker.py passes via env
     # rather than via flags. Worker prefers flags but env is the legacy
@@ -1173,7 +1211,8 @@ def main():
                   args.classifier,
                   polish_int_ckpt=polish_int,
                   polish_ext_ckpt=polish_ext,
-                  skip_mid_stems=skip_set)
+                  skip_mid_stems=skip_set,
+                  single_stems=single_set)
 
 
 if __name__ == "__main__":
