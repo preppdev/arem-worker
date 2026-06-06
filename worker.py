@@ -867,19 +867,22 @@ def process_job(job: dict) -> dict:
     )
     sort_order_start = (makeup.get("nextSortOrder") or 1) if makeup else 1
 
-    # Single-frame recovery (per-frame orphan recovery): a make-up child job
-    # whose envelope also carries `singleStems`. We develop ONLY those stems as
-    # singles and append them to the PARENT (effective_job_id + nextSortOrder
-    # already routed via the make-up envelope above), so the parent's output /
-    # watchdog state are untouched. skip_mid_stems never contains orphans (they
-    # were never processed), so they aren't filtered out.
-    single_recovery_stems: set[str] = (
-        {s.strip() for s in str(makeup.get("singleStems") or "").split(",") if s.strip()}
-        if makeup else set()
-    )
+    # Single-frame recovery (per-frame orphan recovery): a recovery child job
+    # whose envelope carries `singleStems` — from the make-up envelope (Dropbox
+    # shoots) OR the manual-upload envelope (operator uploads). Develop ONLY
+    # those stems as singles and append to the parent: Dropbox routes via the
+    # make-up envelope (effective_job_id + nextSortOrder); manual appends to the
+    # same R2 outputPrefix. skip_mid_stems never contains orphans (never
+    # processed), so they aren't filtered out.
+    _ss = (makeup.get("singleStems") if makeup else None) or (
+        manual.get("singleStems") if manual else None)
+    single_recovery_stems: set[str] = {
+        s.strip() for s in str(_ss or "").split(",") if s.strip()
+    }
     if single_recovery_stems:
         log(f"  single-frame recovery: {len(single_recovery_stems)} stem(s) "
-            f"({', '.join(sorted(single_recovery_stems))}) → parent {effective_job_id}; "
+            f"({', '.join(sorted(single_recovery_stems))}) → "
+            f"{'manual outputs' if manual else 'parent ' + str(effective_job_id)}; "
             f"sortOrderStart={sort_order_start}")
 
     work = WORK_ROOT / job_id
