@@ -62,6 +62,8 @@ jobs:
           RUNPOD_REGISTRY_AUTH_ID: ${{ secrets.RUNPOD_REGISTRY_AUTH_ID }}
           IMAGE_REPO: ghcr.io/${{ github.repository }}
           GIT_SHA: ${{ github.sha }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -e
           python3 - <<'PY'
@@ -121,17 +123,24 @@ jobs:
           # production dual-write (R2 tours/<job>/photos + Cloudflare Images)
           # silently no-ops when R2_OUTPUT_BUCKET is unset, which is how
           # cloud-processed shoots ended up with no productionR2Path/cfImageId.
-          # Non-secret bucket name → safe to declare here. Secrets (CF/R2 keys)
-          # stay managed in the RunPod template; we only log their presence.
+          # R2_OUTPUT_BUCKET is a non-secret bucket name (declared here);
+          # the Cloudflare creds come from GH Actions secrets (only injected
+          # when present, so a missing secret never clobbers an existing
+          # value). Without these the worker's production dual-write no-ops
+          # (R2_OUTPUT_BUCKET) or skips cfImageId (CF creds).
           env = list(input_var.get("env") or [])
           print("template env keys (before):", sorted(e["key"] for e in env))
-          REQUIRED_ENV = {"R2_OUTPUT_BUCKET": "arem-production-edit-jobs"}
           by_key = {e["key"]: e for e in env}
-          for k, v in REQUIRED_ENV.items():
+          def ensure(k, v):
+              if not v:
+                  return
               if k in by_key:
                   by_key[k]["value"] = v
               else:
-                  env.append({"key": k, "value": v})
+                  e = {"key": k, "value": v}; env.append(e); by_key[k] = e
+          ensure("R2_OUTPUT_BUCKET", "arem-production-edit-jobs")
+          ensure("CLOUDFLARE_API_TOKEN", os.environ.get("CLOUDFLARE_API_TOKEN", ""))
+          ensure("CLOUDFLARE_ACCOUNT_ID", os.environ.get("CLOUDFLARE_ACCOUNT_ID", ""))
           input_var["env"] = [{"key": e["key"], "value": e["value"]} for e in env]
           print("template env keys (after): ", sorted(e["key"] for e in input_var["env"]))
 
