@@ -107,7 +107,14 @@ def fetch_file(key: str, dest: Path, bucket: str) -> bool:
 
 def upload_to_dropbox(local: Path, dropbox_full_path: str) -> bool:
     """`dropbox_full_path` = "AREM (Spiro Uploads)/.../08-Test-Edit/sky-swap/<file.jpg>"."""
-    r = rclone(["copyto", str(local), f"dropbox:{dropbox_full_path}"])
+    # Requests may pass dropboxJobPath WITH the rclone remote prefix already
+    # attached ("dropbox:AREM (Spiro Uploads)/..."). Strip any leading
+    # "dropbox:" so we do not build a "dropbox:dropbox:..." destination,
+    # which rclone files under a literal top-level "dropbox:AREM ..." folder.
+    p = dropbox_full_path
+    while p.startswith("dropbox:"):
+        p = p[len("dropbox:"):]
+    r = rclone(["copyto", str(local), f"dropbox:{p}"])
     return r.returncode == 0
 
 
@@ -311,11 +318,25 @@ def write_done(rid: str, payload: dict, scratch: Path) -> None:
     put_file(dj, f"{RES_PREFIX}/{rid}/done.json")
 
 
+def delete_request(rid: str) -> None:
+    """Remove a request file from R2 once we have written done.json (or
+    discovered an existing one). Without this the queue accumulates ghost
+    entries forever: each poll re-lists the file, sees the done marker,
+    skips processing — but never clears the request itself."""
+    try:
+        rclone(["deletefile", f"{RCLONE_R2}:{R2_BUCKET}/{REQ_PREFIX}/{rid}.json"])
+    except Exception as e:
+        log(f"[skyswap] failed to delete request {rid}: {e}")
+
+
 def poll_once(scratch: Path) -> int:
     ids = list_requests()
     n = 0
+    n_cleared = 0
     for rid in ids:
         if result_done(rid):
+            delete_request(rid)
+            n_cleared += 1
             continue
         req = fetch_json(f"{REQ_PREFIX}/{rid}.json", scratch / f"{rid}__req.json")
         if not req:
@@ -326,8 +347,11 @@ def poll_once(scratch: Path) -> int:
         except Exception as e:
             res = {"id": rid, "status": "error", "error": str(e)}
         write_done(rid, res, scratch)
+        delete_request(rid)
         log(f"[skyswap] {rid} -> {res['status']} ({res.get('runtimeMs')}ms)")
         n += 1
+    if n_cleared > 0:
+        log(f"[skyswap] cleared {n_cleared} ghost requests (already had done.json)")
     return n
 
 

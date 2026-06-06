@@ -67,6 +67,79 @@ METADATA=$(cat <<EOF
 EOF
 )
 
+# Snippet inserted into host_heartbeat.sh after METADATA generation.
+# Builds a JSON array describing each long-running systemd unit so the
+# dashboard can render one card per service.
+
+SERVICES_LIST=(
+  "system:arem-sky-swap.service"
+  "system:arem-enhancement-local.service"
+  "system:arem-inpaint-sandbox.service"
+  "system:arem-pretagger.service"
+  "system:arem-worker-local.service"
+  "user:arem-video-render.service"
+)
+
+# Short slug used in workerId (must NOT contain dots / spaces; matches
+# the dashboard's expected service name)
+service_slug() {
+  case "$1" in
+    arem-sky-swap.service)        echo "sky-swap" ;;
+    arem-enhancement-local.service) echo "enhancement" ;;
+    arem-inpaint-sandbox.service) echo "inpaint-sandbox" ;;
+    arem-pretagger.service)       echo "pretagger" ;;
+    arem-worker-local.service)    echo "worker-local" ;;
+    arem-video-render.service)    echo "video-render" ;;
+    *) echo "$1" | sed 's/\.service$//' ;;
+  esac
+}
+
+systemctl_show_safe() {
+  # Args: $1=scope (system|user), $2=unit. Echoes a tab-separated tuple:
+  #   active_state  sub_state  active_enter_ts  n_restarts  uptime_sec
+  local scope="$1" unit="$2"
+  local args=()
+  if [ "$scope" = "user" ]; then args+=("--user"); export XDG_RUNTIME_DIR="/run/user/$(id -u)"; fi
+  local out
+  out=$(systemctl "${args[@]}" show "$unit" \
+    -p ActiveState,SubState,ActiveEnterTimestamp,NRestarts 2>/dev/null || echo "")
+  local active sub ts nr
+  active=$(echo "$out" | sed -n 's/^ActiveState=//p')
+  sub=$(echo "$out" | sed -n 's/^SubState=//p')
+  ts=$(echo "$out" | sed -n 's/^ActiveEnterTimestamp=//p')
+  nr=$(echo "$out" | sed -n 's/^NRestarts=//p')
+  local uptime=""
+  if [ -n "$ts" ] && [ "$ts" != "0" ] && [ "$ts" != "n/a" ]; then
+    local epoch
+    epoch=$(date -d "$ts" +%s 2>/dev/null || echo "")
+    if [ -n "$epoch" ]; then
+      uptime=$(( $(date +%s) - epoch ))
+    fi
+  fi
+  printf '%s\t%s\t%s\t%s\t%s' "${active:-unknown}" "${sub:-unknown}" "${ts:-}" "${nr:-0}" "${uptime:-}"
+}
+
+build_services_json() {
+  local first=1
+  local out="["
+  for entry in "${SERVICES_LIST[@]}"; do
+    local scope="${entry%%:*}"
+    local unit="${entry#*:}"
+    local slug
+    slug=$(service_slug "$unit")
+    IFS=$'\t' read -r active sub ts nr uptime < <(systemctl_show_safe "$scope" "$unit")
+    if [ $first -eq 0 ]; then out+=","; fi
+    first=0
+    local uptime_json="null"
+    [ -n "$uptime" ] && [[ "$uptime" =~ ^[0-9]+$ ]] && uptime_json="$uptime"
+    local nr_json="0"
+    [[ "$nr" =~ ^[0-9]+$ ]] && nr_json="$nr"
+    out+="{\"name\":\"${slug}\",\"status\":\"${active}\",\"subState\":\"${sub}\",\"uptimeSec\":${uptime_json},\"nRestarts\":${nr_json},\"activeEnterTs\":\"${ts}\"}"
+  done
+  out+="]"
+  printf '%s' "$out"
+}
+
 # Send heartbeat + receive any operator-triggered action to perform.
 # Possible actions:
 #   restart_worker — restart the arem-worker-local systemd unit
@@ -75,7 +148,7 @@ EOF
 RESPONSE=$(curl -s -X POST "${DASHBOARD_URL}/api/internal/heartbeat" \
   -H "Content-Type: application/json" \
   -H "x-worker-token: ${WORKER_TOKEN:-}" \
-  -d "{\"workerId\":\"${WORKER_ID}\",\"metadata\":${METADATA}}" \
+  -d "{\"workerId\":\"${WORKER_ID}\",\"metadata\":${METADATA},\"services\":$(build_services_json)}" \
   --max-time 10 || true)
 
 # Parse pendingAction without jq (pure bash + python fallback).
@@ -117,6 +190,19 @@ if [ -n "$SIBLING_ACTIONS" ]; then
       restart_worker)
         sudo /bin/systemctl restart arem-worker-local.service
         ;;
+      restart_service)
+        # SIB_ID looks like service-{slug}-{hostsuffix}. Extract slug.
+        SVC_SLUG=$(echo "$SIB_ID" | sed -E "s/^service-(.*)-$(hostname -s)$/\1/")
+        case "$SVC_SLUG" in
+          sky-swap)        sudo /bin/systemctl restart arem-sky-swap.service ;;
+          enhancement)     sudo /bin/systemctl restart arem-enhancement-local.service ;;
+          inpaint-sandbox) sudo /bin/systemctl restart arem-inpaint-sandbox.service ;;
+          pretagger)       sudo /bin/systemctl restart arem-pretagger.service ;;
+          worker-local)    sudo /bin/systemctl restart arem-worker-local.service ;;
+          video-render)    XDG_RUNTIME_DIR="/run/user/$(id -u)" /bin/systemctl --user restart arem-video-render.service ;;
+          *) echo "[heartbeat] unknown service slug: $SVC_SLUG (skipping)"; continue ;;
+        esac
+        ;;
       *)
         echo "[heartbeat] unknown sibling action: $SIB_ACTION (skipping)"
         continue
@@ -157,6 +243,26 @@ case "$PENDING" in
   restart_worker)
     sudo /bin/systemctl restart arem-worker-local.service
     EXECUTED="restart_worker"
+    ;;
+  restart_sky_swap)
+    sudo /bin/systemctl restart arem-sky-swap.service
+    EXECUTED="restart_sky_swap"
+    ;;
+  restart_enhancement)
+    sudo /bin/systemctl restart arem-enhancement-local.service
+    EXECUTED="restart_enhancement"
+    ;;
+  restart_inpaint_sandbox)
+    sudo /bin/systemctl restart arem-inpaint-sandbox.service
+    EXECUTED="restart_inpaint_sandbox"
+    ;;
+  restart_pretagger)
+    sudo /bin/systemctl restart arem-pretagger.service
+    EXECUTED="restart_pretagger"
+    ;;
+  restart_video_render)
+    XDG_RUNTIME_DIR="/run/user/$(id -u)" /bin/systemctl --user restart arem-video-render.service
+    EXECUTED="restart_video_render"
     ;;
   reboot_host)
     # Report the executed action first (we won't be alive after reboot
