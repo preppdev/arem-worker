@@ -117,6 +117,24 @@ jobs:
           input_var["imageName"] = image
           input_var["containerRegistryAuthId"] = reg_id
 
+          # Ensure required worker env is present on the template. The worker's
+          # production dual-write (R2 tours/<job>/photos + Cloudflare Images)
+          # silently no-ops when R2_OUTPUT_BUCKET is unset, which is how
+          # cloud-processed shoots ended up with no productionR2Path/cfImageId.
+          # Non-secret bucket name → safe to declare here. Secrets (CF/R2 keys)
+          # stay managed in the RunPod template; we only log their presence.
+          env = list(input_var.get("env") or [])
+          print("template env keys (before):", sorted(e["key"] for e in env))
+          REQUIRED_ENV = {"R2_OUTPUT_BUCKET": "arem-production-edit-jobs"}
+          by_key = {e["key"]: e for e in env}
+          for k, v in REQUIRED_ENV.items():
+              if k in by_key:
+                  by_key[k]["value"] = v
+              else:
+                  env.append({"key": k, "value": v})
+          input_var["env"] = [{"key": e["key"], "value": e["value"]} for e in env]
+          print("template env keys (after): ", sorted(e["key"] for e in input_var["env"]))
+
           m = """mutation S($input: SaveTemplateInput!) {
               saveTemplate(input: $input) { id imageName }
           }"""
