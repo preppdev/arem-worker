@@ -467,6 +467,48 @@ def load_stage1(ckpt: Path, device):
     return model
 
 
+def load_stage1_single(ckpt: Path, device):
+    """Single-frame Stage 1S: a 3-channel mid-only NAFNet distilled from the
+    9-channel teacher. residual_start=0 (the mid IS the whole input). Width is
+    read from the checkpoint. Used for single (non-bracket) frames so they get
+    the teacher's developed look instead of a soft degenerate-bracket pass."""
+    ck = torch.load(str(ckpt), map_location=device, weights_only=False)
+    sd = ck.get("ema_state_dict")
+    if isinstance(sd, dict) and "shadow" in sd:
+        sd = sd["shadow"]
+    if not sd:
+        sd = ck["model_state_dict"]
+    sd = {k.replace("module.", "", 1): v for k, v in sd.items()}
+    width = sd["intro.weight"].shape[0] if "intro.weight" in sd else 64
+    model = NAFNet(in_channels=3, out_channels=3, width=width,
+                   middle_blk_num=12, enc_blk_nums=[2, 2, 4, 8],
+                   dec_blk_nums=[2, 2, 2, 2], use_residual=True,
+                   residual_start=0).to(device)
+    sd = {k: v for k, v in sd.items() if k in model.state_dict()}
+    model.load_state_dict(sd, strict=False)
+    model.eval()
+    print(f"  Stage 1S (single) loaded ({len(sd)} keys) w={width} ep={ck.get('epoch')} "
+          f"lpips={ck.get('metrics', {}).get('lpips', '?')}", flush=True)
+    return model
+
+
+def single_stage1_infer(model, mid16, device) -> np.ndarray:
+    """3-channel mid-only Stage 1S inference (mirrors stage1_infer, one frame)."""
+    h, w = mid16.shape[:2]
+    h16, w16 = (h // 16) * 16, (w // 16) * 16
+    mid16 = mid16[:h16, :w16]
+    arr = mid16.astype(np.float32) / 65535.0
+    x = torch.from_numpy(np.ascontiguousarray(arr)).permute(2, 0, 1).unsqueeze(0).to(device)
+    with torch.no_grad():
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            y = model(x)
+    y = torch.clamp(y, 0, 1)
+    out = (y.squeeze(0).float().cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return out
+
+
 def lens_correct_16(arw: Path, db) -> tuple[np.ndarray, dict]:
     """Decode + (if raw) lens-correct, returning uint16 RGB.
 
@@ -868,7 +910,8 @@ def process_shoot(raw_dir: Path, out_dir: Path,
                   polish_int_ckpt: Path | None = None,
                   polish_ext_ckpt: Path | None = None,
                   skip_mid_stems: set[str] | None = None,
-                  single_stems: set[str] | None = None) -> dict:
+                  single_stems: set[str] | None = None,
+                  auto_single: bool = False) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     s1_dir = out_dir / "stage1"
     s2_dir = out_dir / "stage2"
@@ -880,6 +923,11 @@ def process_shoot(raw_dir: Path, out_dir: Path,
 
     print("Loading models...", flush=True)
     s1 = load_stage1(stage1_ckpt, device)
+    # Optional single-frame Stage 1S model (env CHECKPOINT_STAGE1_SINGLE). When
+    # present, single (non-bracket) frames develop through it instead of the
+    # degenerate-bracket fallback.
+    _s1s_ckpt = os.environ.get("CHECKPOINT_STAGE1_SINGLE")
+    s1_single = load_stage1_single(Path(_s1s_ckpt), device) if _s1s_ckpt else None
     s2_int = load_stage2(int_ckpt, device)
     s2_ext = load_stage2(ext_ckpt, device)
     # Stage 3 polish (optional, per-route). A missing ckpt for a lane
@@ -930,6 +978,17 @@ def process_shoot(raw_dir: Path, out_dir: Path,
             print(f"  {len(orphan_frames)} orphan frame(s) (not in any bracket): "
                   f"{', '.join(o['stem'] for o in orphan_frames[:12])}"
                   f"{' …' if len(orphan_frames) > 12 else ''}", flush=True)
+
+    # auto_single (manual uploads): develop every orphan frame (not in any
+    # bracket) as a single in THIS same pass, so a lone upload is processable
+    # and singles stay in the same job as the brackets. Runs after orphan
+    # capture; no-op in explicit single-recovery mode (orphan_frames is empty).
+    if auto_single and orphan_frames:
+        _by_stem = {a.stem: a for a in arws}
+        singles = [_by_stem[o["stem"]] for o in orphan_frames if o["stem"] in _by_stem]
+        if singles:
+            print(f"  auto-single: developing {len(singles)} orphan frame(s) "
+                  f"as single frames (no HDR merge)", flush=True)
 
     # Makeup-job optimization: the worker passes skip_mid_stems for the
     # midStems that the parent already has finished JPGs for. Drop them
@@ -1130,7 +1189,21 @@ def process_shoot(raw_dir: Path, out_dir: Path,
             continue
         t_demos = time.time()
         m16 = resize_max_mp(m16, MAX_MP)
-        s1_out = (m16 >> 8).astype(np.uint8)  # 16-bit sRGB → 8-bit
+        # Run the single through the Stage-1 net as a degenerate bracket
+        # (under=mid=over). A raw 16→8 bit-shift skipped Stage 1 entirely,
+        # leaving the frame soft AND out-of-domain for Stage 2 (which is
+        # trained on Stage-1 outputs). Identical exposures give the net no
+        # extra dynamic range (correct — a single has none) but apply the
+        # same detail/tone development, so singles match the bracket look.
+        if s1_single is not None:
+            s1_out = single_stage1_infer(s1_single, m16, device)
+        else:
+            try:
+                s1_out = stage1_infer(s1, m16, m16, m16, device)
+            except Exception as e:
+                print(f"  [single {si}/{len(singles)}] {stem}: stage1 fail: {e}; "
+                      f"falling back to bit-shift", flush=True)
+                s1_out = (m16 >> 8).astype(np.uint8)  # 16-bit sRGB → 8-bit
         t_s1 = time.time()
         finish_image(si, len(singles), stem, s1_out, t0, t_demos, t_s1,
                      frame, frame, frame, single=True, lens_info=mi)
@@ -1194,6 +1267,10 @@ def main():
                           "(alternative Stage 1 — no bracketing). When set, "
                           "ONLY these frames are processed (single-frame "
                           "orphan recovery).")
+    ap.add_argument("--auto-single", action="store_true",
+                     help="Develop every orphan frame (not in any bracket) as "
+                          "a single in the same pass as the brackets. Used by "
+                          "manual uploads so a lone photo is processable.")
     args = ap.parse_args()
     skip_set = {s.strip() for s in args.skip_mid_stems.split(",") if s.strip()}
     single_set = {s.strip() for s in args.single_stems.split(",") if s.strip()}
@@ -1212,7 +1289,8 @@ def main():
                   polish_int_ckpt=polish_int,
                   polish_ext_ckpt=polish_ext,
                   skip_mid_stems=skip_set,
-                  single_stems=single_set)
+                  single_stems=single_set,
+                  auto_single=args.auto_single)
 
 
 if __name__ == "__main__":

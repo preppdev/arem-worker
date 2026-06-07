@@ -351,7 +351,8 @@ def download_raws(dropbox_remote_path: str, local_raw_dir: Path) -> tuple[int, i
 def run_inference(local_raw_dir: Path, pred_root: Path,
                   polish_ckpts: dict[str, Path | None] | None = None,
                   skip_mid_stems: set[str] | None = None,
-                  single_stems: set[str] | None = None) -> Path:
+                  single_stems: set[str] | None = None,
+                  auto_single: bool = False) -> Path:
     """Run the canonical Stage 1 (NAFNet) + Stage 2 (NAFNet routed) +
     Stage 3 (NAFNet polish, optional) pipeline.
 
@@ -387,6 +388,10 @@ def run_inference(local_raw_dir: Path, pred_root: Path,
     # bracketing) — the per-frame orphan-recovery path.
     if single_stems:
         cmd += ["--single-stems", ",".join(sorted(single_stems))]
+    # Auto-single: develop orphan frames as singles in the same pass as the
+    # brackets (manual uploads — a lone photo is a valid upload).
+    if auto_single:
+        cmd += ["--auto-single"]
     # CHECKPOINT_STAGE1 / CHECKPOINT_INTERIOR / CHECKPOINT_EXTERIOR /
     # CLASSIFIER_PATH come from the environment (Dockerfile defaults).
     log(f"  inference: {' '.join(cmd)}")
@@ -885,6 +890,15 @@ def process_job(job: dict) -> dict:
             f"{'manual outputs' if manual else 'parent ' + str(effective_job_id)}; "
             f"sortOrderStart={sort_order_start}")
 
+    # Manual uploads develop every uploaded frame: brackets + orphan singles in
+    # one pass (autoSingle, default on). Disabled when an explicit single-frame
+    # recovery subset is requested (that path is targeted, not "everything").
+    auto_single_enabled = bool(
+        manual and manual.get("autoSingle", True) and not single_recovery_stems
+    )
+    if auto_single_enabled:
+        log("  auto-single: orphan frames will be developed as singles in this pass")
+
     work = WORK_ROOT / job_id
     raw_dir = work / "raws"
     pred_root = work / "predictions"
@@ -929,7 +943,8 @@ def process_job(job: dict) -> dict:
     pred_dir = run_inference(raw_dir, pred_root,
                              polish_ckpts=polish_ckpts,
                              skip_mid_stems=skip_mid_stems,
-                             single_stems=single_recovery_stems)
+                             single_stems=single_recovery_stems,
+                             auto_single=auto_single_enabled)
 
     log("  [3/4] auto-upright + EXIF/branding")
     upright_dir = run_upright(pred_dir, upright_root, raw_dir)
@@ -949,7 +964,21 @@ def process_job(job: dict) -> dict:
             log(f"    manual Dropbox delivery: rc={_mr.returncode} -> {_mdst}")
         except Exception as _me:
             log(f"  WARN manual Dropbox delivery: {str(_me)[:200]}")
+        # Production dual-write — same as Dropbox jobs — so manual uploads are
+        # first-class: productionR2Path + cfImageId land on each ImageReview,
+        # which surfaces them in delivery (via CF) and the photo-stream (the
+        # classification POST records a StreamEvent only when cfImageId is set).
         production_records: list[dict] = []
+        if R2_OUTPUT_BUCKET:
+            try:
+                production_records = upload_outputs_production_r2(
+                    upright_dir, job_id, sort_order_start=1)
+                n_cf = sum(1 for r in production_records if r.get("cfImageId"))
+                log(f"    production dual-write: {len(production_records)} files \u2192 "
+                    f"r2:{R2_OUTPUT_BUCKET}/tours/{job_id}/photos/  "
+                    f"cf_images={n_cf}/{len(production_records)}")
+            except Exception as e:
+                log(f"  WARN production dual-write (manual): {str(e)[:200]}")
     else:
         log(f"  [4/4] uploading to {DROPBOX_OUTPUT_FOLDER}")
         # Dropbox upload is content-aware (rclone copy skips identical
