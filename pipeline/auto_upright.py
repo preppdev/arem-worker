@@ -79,6 +79,12 @@ UPRIGHT_ENGINE   = os.environ.get("AREM_UPRIGHT_ENGINE", "geocalib").lower()
 GC_CONF_GATE     = float(os.environ.get("UPRIGHT_GC_CONF_GATE", "0.03"))
 GC_VK_SCALE      = float(os.environ.get("UPRIGHT_GC_VK_SCALE",  "0.7"))
 GC_ROT_CLIP_DEG  = float(os.environ.get("UPRIGHT_GC_ROT_CLIP",  "5.0"))
+# AREM_UPRIGHT_REQUIRE (default 1): GeoCalib is REQUIRED — if the model can't
+# load or inference fails, the run ABORTS (the worker marks the job errored)
+# instead of silently shipping a Hough-corrected output. Set to 0 only as an
+# emergency kill switch. Rationale: the 06-07 fleet rebuild dropped the
+# geocalib dep and production fell back to Hough silently for 4 days.
+UPRIGHT_REQUIRE  = os.environ.get("AREM_UPRIGHT_REQUIRE", "1") in ("1", "true", "yes")
 
 # Process-level lazy-load. False sentinel = load attempted and failed,
 # don't retry within this process; fall back to Hough silently.
@@ -100,6 +106,11 @@ def _get_geocalib_model():
               f"rot_clip={GC_ROT_CLIP_DEG}°)", flush=True)
         return _GC_MODEL
     except Exception as e:
+        if UPRIGHT_REQUIRE:
+            raise RuntimeError(
+                f"GeoCalib REQUIRED but unavailable ({type(e).__name__}: "
+                f"{str(e)[:160]}). Install geocalib in the worker env or set "
+                f"AREM_UPRIGHT_REQUIRE=0 to permit the Hough fallback.") from e
         print(f"[auto_upright] GeoCalib unavailable ({type(e).__name__}: "
               f"{str(e)[:120]}); falling back to Hough", flush=True)
         _GC_MODEL = False
@@ -385,7 +396,9 @@ def _gc_predict_and_warp(img_bgr: np.ndarray) -> tuple[np.ndarray | None, dict]:
         return img_bgr.copy(), metrics
 
     # Apply tuned damping
-    roll_eff = 0.0 if abs(roll_deg) > GC_ROT_CLIP_DEG else roll_deg
+    # Clamp (NOT zero) large rolls: the most-crooked frames need correction
+    # the most. The cap still guards against pathological predictions.
+    roll_eff = max(-GC_ROT_CLIP_DEG, min(GC_ROT_CLIP_DEG, roll_deg))
     pitch_eff = pitch_deg * GC_VK_SCALE
     metrics["gc_roll_applied_deg"]  = round(roll_eff, 3)
     metrics["gc_pitch_applied_deg"] = round(pitch_eff, 3)
