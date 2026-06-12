@@ -38,9 +38,9 @@ class DS(Dataset):
         return (TR if self.train else VA)(img), cls_idx[label]
 
 train_dl = DataLoader(DS(train_items, True), batch_size=BATCH, shuffle=True,
-                      num_workers=WORKERS, pin_memory=True, drop_last=True, persistent_workers=True, prefetch_factor=4)
+                      num_workers=WORKERS, pin_memory=False, drop_last=True, persistent_workers=True, prefetch_factor=2)
 val_dl = DataLoader(DS(val_items, False), batch_size=BATCH, shuffle=False,
-                    num_workers=WORKERS, pin_memory=True, persistent_workers=True)
+                    num_workers=WORKERS, pin_memory=False, persistent_workers=True)
 dev = "cuda"
 model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
 model.fc = nn.Linear(model.fc.in_features, 2)

@@ -13,6 +13,8 @@ import csv, json, os, random
 from collections import defaultdict
 
 import torch
+import torch.multiprocessing as _tmp
+_tmp.set_sharing_strategy("file_system")  # native-res tensors exhaust /dev/shm with the default strategy
 from PIL import Image
 import torchvision.transforms.v2 as T
 import torchvision.transforms.v2.functional as TF

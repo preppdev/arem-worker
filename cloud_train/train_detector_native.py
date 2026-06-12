@@ -6,6 +6,8 @@ import json, os, time
 from collections import defaultdict
 
 import torch
+import torch.multiprocessing as _tmp
+_tmp.set_sharing_strategy("file_system")
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 from torchvision.models.detection import fasterrcnn_resnet50_fpn_v2
@@ -43,7 +45,7 @@ class DetDS(Dataset):
 def collate(b): return tuple(zip(*b))
 
 train_dl = DataLoader(DetDS(f"{DATA}/detector/ann_train_native.json", True), batch_size=BATCH,
-                      shuffle=True, num_workers=WORKERS, collate_fn=collate, persistent_workers=True, prefetch_factor=4)
+                      shuffle=True, num_workers=WORKERS, collate_fn=collate, persistent_workers=True, prefetch_factor=2)
 val_ds = DetDS(f"{DATA}/detector/ann_val_native.json", False)
 val_dl = DataLoader(val_ds, batch_size=BATCH, shuffle=False, num_workers=WORKERS, collate_fn=collate, persistent_workers=True)
 dev = "cuda"
