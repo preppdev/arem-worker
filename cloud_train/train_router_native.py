@@ -7,11 +7,10 @@ from collections import Counter
 
 import torch
 import torch.nn as nn
-from PIL import Image
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from torchvision.models import resnet18, ResNet18_Weights
 
-from common import DATA, NATIVE_HW, load_labeled, shoot_split, train_tfm, val_tfm
+from common import DATA, NATIVE_HW, load_labeled, shoot_split, BytesDS, bytes_collate, GpuPrep
 
 OUT = os.environ.get("OUT", "/workspace/runs/router_native")
 EPOCHS = int(os.environ.get("EPOCHS", "8"))
@@ -27,21 +26,12 @@ cls_idx = {c: i for i, c in enumerate(classes)}
 train_items, val_items = shoot_split(items)
 print(f"{len(items)} imgs {Counter(l for _, l in items)} | train {len(train_items)} / val {len(val_items)}", flush=True)
 
-TR, VA = train_tfm(), val_tfm()
-
-class DS(Dataset):
-    def __init__(self, rows, train): self.rows, self.train = rows, train
-    def __len__(self): return len(self.rows)
-    def __getitem__(self, i):
-        rel, label = self.rows[i]
-        img = Image.open(f"{DATA}/originals/{rel}").convert("RGB")
-        return (TR if self.train else VA)(img), cls_idx[label]
-
-train_dl = DataLoader(DS(train_items, True), batch_size=BATCH, shuffle=True,
-                      num_workers=WORKERS, pin_memory=False, drop_last=True, persistent_workers=True, prefetch_factor=2)
-val_dl = DataLoader(DS(val_items, False), batch_size=BATCH, shuffle=False,
-                    num_workers=WORKERS, pin_memory=False, persistent_workers=True)
+train_dl = DataLoader(BytesDS(train_items, cls_idx, DATA), batch_size=BATCH, shuffle=True,
+                      num_workers=WORKERS, collate_fn=bytes_collate, drop_last=True, persistent_workers=True, prefetch_factor=4)
+val_dl = DataLoader(BytesDS(val_items, cls_idx, DATA), batch_size=BATCH, shuffle=False,
+                    num_workers=WORKERS, collate_fn=bytes_collate, persistent_workers=True)
 dev = "cuda"
+prep_train, prep_val = GpuPrep(train=True), GpuPrep(train=False)
 model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
 model.fc = nn.Linear(model.fc.in_features, 2)
 model.to(dev)
@@ -54,8 +44,8 @@ def evaluate():
     model.eval()
     conf = torch.zeros(2, 2, dtype=torch.long)
     with torch.no_grad(), torch.amp.autocast("cuda"):
-        for x, y in val_dl:
-            p = model(x.to(dev)).argmax(1).cpu()
+        for bl, y in val_dl:
+            p = model(prep_val(bl)).argmax(1).cpu()
             for t_, q in zip(y, p): conf[t_, q] += 1
     acc = conf.diag().sum().item() / conf.sum().item()
     rec = {classes[i]: round(conf[i, i].item() / max(1, conf[i].sum().item()), 4) for i in range(2)}
@@ -65,8 +55,8 @@ def evaluate():
 best = 0.0
 for ep in range(1, EPOCHS + 1):
     model.train(); t0, seen, lsum = time.time(), 0, 0.0
-    for x, y in train_dl:
-        x, y = x.to(dev, non_blocking=True), y.to(dev, non_blocking=True)
+    for bl, y in train_dl:
+        x, y = prep_train(bl), y.to(dev, non_blocking=True)
         opt.zero_grad(set_to_none=True)
         with torch.amp.autocast("cuda"):
             loss = crit(model(x), y)

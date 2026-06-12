@@ -8,11 +8,10 @@ from collections import Counter
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from PIL import Image
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from torchvision.models import convnext_base, ConvNeXt_Base_Weights
 
-from common import DATA, NATIVE_HW, load_labeled, shoot_split, train_tfm, val_tfm
+from common import DATA, NATIVE_HW, load_labeled, shoot_split, bytes_collate, GpuPrep
 
 OUT = os.environ.get("OUT", "/workspace/runs/room_native_b")
 EPOCHS = int(os.environ.get("EPOCHS", "16"))
@@ -38,25 +37,24 @@ train_aug = [(r, l, False) for r, l in train_items] + dups
 print(f"{len(items)} imgs {len(classes)} classes | train {len(train_items)} (+{len(dups)} dups) / val {len(val_items)}", flush=True)
 print("dist:", dict(counts.most_common()), flush=True)
 
-TR, VA = train_tfm(), val_tfm()
-
-class DS(Dataset):
+class RoomBytesDS(torch.utils.data.Dataset):
     def __init__(self, rows, train):
         self.rows, self.train = rows, train
     def __len__(self): return len(self.rows)
     def __getitem__(self, i):
         if self.train:
-            rel, label, flip = self.rows[i]
+            rel, label, _flip = self.rows[i]
         else:
-            rel, label = self.rows[i]; flip = False
-        img = Image.open(f"{DATA}/originals/{rel}").convert("RGB")
-        if flip: img = img.transpose(Image.FLIP_LEFT_RIGHT)
-        return (TR if self.train else VA)(img), cls_idx[label]
+            rel, label = self.rows[i]
+        with open(f"{DATA}/originals/{rel}", "rb") as f:
+            data = torch.frombuffer(bytearray(f.read()), dtype=torch.uint8)
+        return data, cls_idx[label]
 
-train_dl = DataLoader(DS(train_aug, True), batch_size=BATCH, shuffle=True,
-                      num_workers=WORKERS, pin_memory=False, drop_last=True, persistent_workers=True, prefetch_factor=2)
-val_dl = DataLoader(DS(val_items, False), batch_size=BATCH, shuffle=False,
-                    num_workers=WORKERS, pin_memory=False, persistent_workers=True)
+train_dl = DataLoader(RoomBytesDS(train_aug, True), batch_size=BATCH, shuffle=True,
+                      num_workers=WORKERS, collate_fn=bytes_collate, drop_last=True, persistent_workers=True, prefetch_factor=4)
+val_dl = DataLoader(RoomBytesDS(val_items, False), batch_size=BATCH, shuffle=False,
+                    num_workers=WORKERS, collate_fn=bytes_collate, persistent_workers=True)
+prep_train, prep_val = GpuPrep(train=True), GpuPrep(train=False)
 dev = "cuda"
 model = convnext_base(weights=ConvNeXt_Base_Weights.IMAGENET1K_V1)
 model.classifier[2] = nn.Linear(model.classifier[2].in_features, len(classes))
@@ -81,8 +79,8 @@ def evaluate(net):
     net.eval()
     conf = torch.zeros(len(classes), len(classes), dtype=torch.long)
     with torch.amp.autocast("cuda"):
-        for x, y in val_dl:
-            x = x.to(dev, non_blocking=True)
+        for bl, y in val_dl:
+            x = prep_val(bl)
             logits = net(x) + net(torch.flip(x, dims=[3]))
             p = logits.argmax(1).cpu()
             for t_, q in zip(y, p): conf[t_, q] += 1
@@ -93,8 +91,8 @@ best = 0.0
 for ep in range(1, EPOCHS + 1):
     model.train(); t0, seen, lsum = time.time(), 0, 0.0
     opt.zero_grad(set_to_none=True)
-    for bi, (x, y) in enumerate(train_dl):
-        x, y = x.to(dev, non_blocking=True), y.to(dev, non_blocking=True)
+    for bi, (bl, y) in enumerate(train_dl):
+        x, y = prep_train(bl), y.to(dev, non_blocking=True)
         with torch.amp.autocast("cuda"):
             if random.random() < MIXUP_P:
                 lam = random.betavariate(MIXUP_ALPHA, MIXUP_ALPHA); lam = max(lam, 1 - lam)
