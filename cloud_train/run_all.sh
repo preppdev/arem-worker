@@ -40,14 +40,25 @@ run_and_ship () {  # name script outdir
   echo "=== $1 SHIPPED -> $R2DEST/$1"
 }
 
+# stage skip logic: a stage with an existing checkpoint is shipped, not
+# retrained (crash-resume + operator early-accept, e.g. router 2026-06-12)
+stage () {  # name script outdir ckpt
+  if [ -f "$4" ]; then
+    echo "=== $1: existing checkpoint accepted — shipping without retraining"
+    rclone copy "$3" "$R2DEST/$1" --transfers 8
+  else
+    run_and_ship "$1" "$2" "$3"
+  fi
+}
+
 echo "=== [2/5] router (ResNet-18 native)"
-run_and_ship router train_router_native.py /workspace/runs/router_native
+stage router train_router_native.py /workspace/runs/router_native /workspace/runs/router_native/router_v4_native.pth
 
 echo "=== [3/5] room classifier (ConvNeXt-Base native)"
-run_and_ship room train_room_native.py /workspace/runs/room_native_b
+stage room train_room_native.py /workspace/runs/room_native_b /workspace/runs/room_native_b/best.pt
 
 echo "=== [4/5] detector (FRCNN native)"
-run_and_ship detector train_detector_native.py /workspace/runs/detector_native
+stage detector train_detector_native.py /workspace/runs/detector_native /workspace/runs/detector_native/best.pth
 
 echo "=== [5/5] ALL_DONE $R2DEST"
 # self-stop the pod if runpodctl is available (saves billing on completion)
