@@ -25,6 +25,8 @@ Env (required):
     DASHBOARD_URL         default https://arem-editing-dashboard.vercel.app
     ANTHROPIC_API_KEY     required for vlm-haiku detector
     GOOGLE_AI_API_KEY     required for nano-banana-pro repair
+    CAMTRIP_DETECTOR_PATH required for frcnn-local detector (default
+                          /home/jordan/models/camtrip_detector_v3_native.pth)
 
 Env (optional):
     WORKER_ID             default enhancement-local-<hostname>
@@ -60,6 +62,8 @@ GOOGLE_AI_API_KEY = os.environ.get("GOOGLE_AI_API_KEY", "")
 R2_PRODUCTION_BUCKET = os.environ.get("R2_PRODUCTION_BUCKET", "arem-production-edit-jobs")
 R2_TRAINING_BUCKET = os.environ.get("R2_TRAINING_BUCKET", "arem-training-data")
 RCLONE_R2 = os.environ.get("RCLONE_R2", "r2")
+CAMTRIP_DETECTOR_PATH = os.environ.get(
+    "CAMTRIP_DETECTOR_PATH", "/home/jordan/models/camtrip_detector_v3_native.pth")
 
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
@@ -157,10 +161,82 @@ def render_annotated(source_bytes: bytes, bbox: dict) -> bytes:
 
 # ---- Detector + Repair dispatchers ------------------------------------------
 
+# Lazy-loaded FRCNN (frcnn-local detector). Loaded on first use within a
+# job and released after (release_frcnn) — this node's GPU is shared with
+# the editing worker, so we don't keep ~2GB of weights resident while idle.
+_FRCNN = None
+_FRCNN_LABELS = {1: "camera", 2: "tripod"}
+
+
+def _load_frcnn():
+    global _FRCNN
+    if _FRCNN is None:
+        import torch  # type: ignore
+        from torchvision.models.detection import fasterrcnn_resnet50_fpn_v2  # type: ignore
+        ck = torch.load(CAMTRIP_DETECTOR_PATH, map_location="cpu", weights_only=False)
+        m = fasterrcnn_resnet50_fpn_v2(
+            weights=None, num_classes=ck["num_classes"],
+            min_size=ck["min_size"], max_size=ck["max_size"])
+        m.load_state_dict(ck["model_state"])
+        m.eval().cuda()
+        _FRCNN = (m, ck.get("version", "frcnn-local"))
+        log(f"frcnn loaded: {ck.get('version')} (mAP50 {ck.get('metrics', {}).get('mAP50')})")
+    return _FRCNN
+
+
+def release_frcnn() -> None:
+    global _FRCNN
+    if _FRCNN is not None:
+        import torch  # type: ignore
+        _FRCNN = None
+        torch.cuda.empty_cache()
+
+
+def call_frcnn_detector(spec: dict, image_bytes: bytes) -> dict:
+    """In-house Faster R-CNN camera/tripod-reflection detector, run locally
+    on the node GPU. Adds `boxes`: fractional [{x,y,w,h,label,score}] for
+    every detection >= 0.5 (the dashboard applies its own flag threshold)."""
+    import torch  # type: ignore
+    import torchvision.io  # type: ignore
+    t0 = time.time()
+    try:
+        model, _version = _load_frcnn()
+        data = torch.frombuffer(bytearray(image_bytes), dtype=torch.uint8)
+        img = torchvision.io.decode_image(data, mode=torchvision.io.ImageReadMode.RGB)
+        _, H, W = img.shape
+        with torch.inference_mode():
+            out = model([img.float().div(255).cuda()])[0]
+    except Exception as e:
+        return {"positive": False, "confidence": None, "region": None,
+                "reason": "", "runtimeMs": int((time.time() - t0) * 1000),
+                "costUsd": None, "error": f"frcnn: {e}", "boxes": []}
+    boxes = []
+    for b, l, s in zip(out["boxes"].cpu(), out["labels"].cpu(), out["scores"].cpu()):
+        score = float(s)
+        if score < 0.5:
+            continue
+        x1, y1, x2, y2 = (float(v) for v in b)
+        boxes.append({
+            "x": x1 / W, "y": y1 / H, "w": (x2 - x1) / W, "h": (y2 - y1) / H,
+            "label": _FRCNN_LABELS.get(int(l), str(int(l))), "score": round(score, 4),
+        })
+    max_score = max((b["score"] for b in boxes), default=0.0)
+    return {
+        "positive": bool(boxes),
+        "confidence": max_score or None,
+        "region": None,
+        "reason": ", ".join(f"{b['label']} {b['score']:.2f}" for b in boxes)[:480],
+        "runtimeMs": int((time.time() - t0) * 1000),
+        "costUsd": None, "error": None, "boxes": boxes,
+    }
+
+
 def call_detector(spec: dict, image_bytes: bytes) -> dict:
     """Returns: { positive: bool, confidence: float|None, region: str|None,
                   reason: str, runtimeMs: int, costUsd: float|None,
-                  error: str|None }"""
+                  error: str|None, boxes?: [...] (frcnn-local only) }"""
+    if spec["type"] == "frcnn-local":
+        return call_frcnn_detector(spec, image_bytes)
     if spec["type"] != "vlm-haiku":
         raise ValueError(f"unsupported detector type: {spec['type']}")
     import anthropic  # type: ignore
@@ -262,6 +338,18 @@ def call_repair(spec: dict, image_bytes: bytes, prompt: str) -> dict:
 
 # ---- Region → bbox ----------------------------------------------------------
 
+def boxes_union_bbox(boxes: list[dict]) -> dict | None:
+    """Union of fractional detector boxes, 3% pad each side (clamped).
+    Mirrors the dashboard's /api/corrections union for the repair marker."""
+    if not boxes:
+        return None
+    x1 = min(b["x"] for b in boxes); y1 = min(b["y"] for b in boxes)
+    x2 = max(b["x"] + b["w"] for b in boxes); y2 = max(b["y"] + b["h"] for b in boxes)
+    px1, py1 = max(0.0, x1 - 0.03), max(0.0, y1 - 0.03)
+    return {"x": px1, "y": py1,
+            "w": min(1.0, x2 + 0.03) - px1, "h": min(1.0, y2 + 0.03) - py1}
+
+
 def region_to_bbox(region: str | None) -> dict | None:
     """Map Haiku's 3×3 grid cell to a fractional bbox (~37% of the image).
     Slight overlap with neighbors so the model has context for the inpaint."""
@@ -342,9 +430,24 @@ def process_job(envelope: dict, dry_run: bool = False) -> tuple[int, int, int]:
                     continue
 
                 n_detected += 1 if detector_spec else 0
+                det_boxes = (det.get("boxes") if detector_spec and not dry_run else None) or []
+
+                # frcnn positives become CorrectionFlag rows on the dashboard
+                # (red outline on /delivery, pooled on /corrections). Distinct
+                # from the EnhancementRequest audit row below.
+                if det_boxes and not dry_run:
+                    try:
+                        _request("POST", "/api/internal/camtrip-detections", {
+                            "jobId": parent["id"],
+                            "midStem": img["midStem"],
+                            "modelVersion": detector_spec["model"],
+                            "boxes": det_boxes,
+                        })
+                    except Exception as e:
+                        log(f"  flag POST ERR {img['midStem']}: {e}")
 
                 # --- repair phase ---
-                bbox = region_to_bbox(det_region) if det_region else None
+                bbox = boxes_union_bbox(det_boxes) or (region_to_bbox(det_region) if det_region else None)
                 if not repair_spec:
                     # detection-only step: just log the result row, no repair.
                     if not dry_run:
@@ -483,6 +586,8 @@ def main() -> int:
                 log(f"job {jid} FAILED: {e}")
                 if not args.dry_run:
                     complete_job(jid, ok=False, error_message=str(e)[:500])
+            finally:
+                release_frcnn()  # GPU is shared with the editing worker
             if args.once: return 0
         else:
             if args.once:
