@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Room classifier v4 — ConvNeXt-Base, NATIVE full-frame (2800x4200 letterbox),
-B200. Full recipe: EMA, TrivialAugment, mixup, tail-class triple-dup,
+"""Room classifier v4 — ConvNeXt-Base, full-frame 1365x2048 letterbox (half
+native; no crops ever), B200. Full recipe: EMA, mixup, tail-class triple-dup,
 sqrt-inverse class weights, label smoothing, hflip TTA, shoot-split seed 17."""
 import copy, json, os, random, time
 from collections import Counter
@@ -11,12 +11,13 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision.models import convnext_base, ConvNeXt_Base_Weights
 
-from common import DATA, NATIVE_HW, load_labeled, shoot_split, bytes_collate, GpuPrep
+from common import DATA, load_labeled, shoot_split, bytes_collate, GpuPrep
 
 OUT = os.environ.get("OUT", "/workspace/runs/room_native_b")
+HW = (int(os.environ.get("HW_H", "1365")), int(os.environ.get("HW_W", "2048")))
 EPOCHS = int(os.environ.get("EPOCHS", "16"))
-BATCH = int(os.environ.get("BATCH", "4"))
-ACCUM = int(os.environ.get("ACCUM", "6"))
+BATCH = int(os.environ.get("BATCH", "12"))
+ACCUM = int(os.environ.get("ACCUM", "2"))
 LR = float(os.environ.get("LR", "3e-4"))
 WORKERS = int(os.environ.get("WORKERS", "24"))
 DUP3_BELOW, DUP2_BELOW = 350, 800
@@ -54,7 +55,7 @@ train_dl = DataLoader(RoomBytesDS(train_aug, True), batch_size=BATCH, shuffle=Tr
                       num_workers=WORKERS, collate_fn=bytes_collate, drop_last=True, persistent_workers=True, prefetch_factor=4)
 val_dl = DataLoader(RoomBytesDS(val_items, False), batch_size=BATCH, shuffle=False,
                     num_workers=WORKERS, collate_fn=bytes_collate, persistent_workers=True)
-prep_train, prep_val = GpuPrep(train=True), GpuPrep(train=False)
+prep_train, prep_val = GpuPrep(hw=HW, train=True), GpuPrep(hw=HW, train=False)
 dev = "cuda"
 model = convnext_base(weights=ConvNeXt_Base_Weights.IMAGENET1K_V1)
 model.classifier[2] = nn.Linear(model.classifier[2].in_features, len(classes))
@@ -112,9 +113,9 @@ for ep in range(1, EPOCHS + 1):
     print(f"ep{ep:02d} loss {lsum/seen:.3f} EMA+TTA acc {acc:.4f} ({time.time()-t0:.0f}s) {per}", flush=True)
     if acc > best:
         best = acc
-        torch.save({"model": ema.state_dict(), "classes": classes, "input_hw": NATIVE_HW,
+        torch.save({"model": ema.state_dict(), "classes": classes, "input_hw": HW,
                     "acc": acc, "arch": "convnext_base", "tta": "hflip", "letterbox": True,
-                    "version": "v4_native_b200"}, f"{OUT}/best.pt")
+                    "version": "v4_2048_b200"}, f"{OUT}/best.pt")
         json.dump({"classes": classes, "matrix": conf.tolist(), "acc": acc}, open(f"{OUT}/confusion.json", "w"))
         print(f"  saved best {best:.4f}", flush=True)
 print(f"ROOM_DONE best {best:.4f}", flush=True)
