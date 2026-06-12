@@ -152,7 +152,10 @@ class GpuPrep:
         self.train = train
         self.mean = torch.tensor(MEAN, device="cuda").view(1, 3, 1, 1)
         self.std = torch.tensor(STD, device="cuda").view(1, 3, 1, 1)
-        self.aug = T.TrivialAugmentWide() if train else None
+        # NOTE: TrivialAugmentWide crashes on CUDA tensors in this loop
+        # (torchvision affine kernel -> hard libtorch abort, found via pod
+        # beacons 2026-06-12). GPU path uses hflip + scalar photometric
+        # jitter instead; mixup at batch level still applies.
 
     def __call__(self, byte_list):
         import torchvision.transforms.v2.functional as F2
@@ -167,9 +170,16 @@ class GpuPrep:
             img = F2.resize(img, [nh, nw], antialias=True)
             if self.train and torch.rand(1).item() < 0.5:
                 img = torch.flip(img, dims=[2])
-            if self.aug is not None:
-                img = self.aug(img)
             top, left = (self.h - nh) // 2, (self.w - nw) // 2
             out[i, :, top:top + nh, left:left + nw] = img
-        x = out.float().div_(255.0).sub_(self.mean).div_(self.std)
+        x = out.float().div_(255.0)
+        if self.train:
+            # photometric jitter: brightness/contrast scalars per image (safe,
+            # pure tensor math — no torchvision kernels)
+            b = torch.empty(x.size(0), 1, 1, 1, device="cuda").uniform_(0.9, 1.1)
+            c = torch.empty(x.size(0), 1, 1, 1, device="cuda").uniform_(0.9, 1.1)
+            mean_per = x.mean(dim=(2, 3), keepdim=True)
+            x = ((x - mean_per) * c + mean_per) * b
+            x = x.clamp_(0, 1)
+        x = x.sub_(self.mean).div_(self.std)
         return x
