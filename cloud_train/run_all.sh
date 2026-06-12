@@ -28,6 +28,10 @@ rclone copy r2:arem-training-data/cloud-train/originals $CLOUD_DATA/originals --
 echo "pulled: $(find $CLOUD_DATA/originals -name '*.jpg' | wc -l) images"
 
 cd "$(dirname "$0")"
+# background log shipper: push live logs to R2 every 4 min for remote monitoring
+( while true; do sleep 240; rclone copy /workspace --include "*.log" $R2DEST/live-logs 2>/dev/null || true; done ) &
+LOGSHIP_PID=$!
+trap "kill $LOGSHIP_PID 2>/dev/null" EXIT
 run_and_ship () {  # name script outdir
   echo "=== $1 START $(date -u +%H:%M)"
   OUT=$3 python3 $2 2>&1 | tee /workspace/$1.log
