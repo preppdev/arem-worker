@@ -570,6 +570,27 @@ def load_stage2(ckpt: Path, device):
     return model
 
 
+class _LetterboxTfm:
+    """Aspect-preserving resize + pad to a fixed canvas (matches the native-res
+    training input of classifier v4+). Plain callable so torch transforms
+    compose stays unused for this path."""
+
+    def __init__(self, hw):
+        self.h, self.w = hw
+        self._norm = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+
+    def __call__(self, im):
+        import torchvision.transforms.functional as TF
+        w, h = im.size
+        s = min(self.w / w, self.h / h)
+        nw, nh = round(w * s), round(h * s)
+        t = TF.to_tensor(TF.resize(im, [nh, nw]))
+        out = torch.zeros(3, self.h, self.w)
+        top, left = (self.h - nh) // 2, (self.w - nw) // 2
+        out[:, top:top + nh, left:left + nw] = t
+        return self._norm(out)
+
+
 def load_classifier(clf_ckpt: Path, device):
     state = torch.load(str(clf_ckpt), map_location=device, weights_only=False)
     label_names = state["label_names"]
@@ -577,12 +598,20 @@ def load_classifier(clf_ckpt: Path, device):
     model.fc = nn.Linear(model.fc.in_features, state["num_classes"])
     model.load_state_dict(state["model_state"])
     model.to(device).eval()
-    tfm = transforms.Compose([
-        transforms.Resize(256), transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ])
-    print(f"  Classifier labels: {label_names} val_acc={state.get('val_acc','?')}", flush=True)
+    input_hw = state.get("input_hw")  # v4+ native-letterbox ckpts carry this
+    if input_hw:
+        tfm = _LetterboxTfm(tuple(input_hw))
+    else:
+        tfm = transforms.Compose([
+            transforms.Resize(256), transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ])
+    print(
+        f"  Classifier labels: {label_names} val_acc={state.get('val_acc','?')} "
+        f"input={'letterbox ' + str(input_hw) if input_hw else '224 center-crop'}",
+        flush=True,
+    )
     return model, label_names, tfm
 
 
