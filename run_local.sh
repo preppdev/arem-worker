@@ -38,7 +38,7 @@ mkdir -p "$WORK_ROOT"
 # Pipeline paths
 export AREM_REPO="$(pwd)/pipeline"
 export UPRIGHT_REPO="$(pwd)/pipeline"
-export CLASSIFIER_PATH="$(pwd)/pipeline/classifier_v3.pth"
+export CLASSIFIER_PATH="$(pwd)/pipeline/classifier_v4.pth"
 export CHECKPOINT_STAGE1="$(pwd)/checkpoints/stage1_jxl_v1_best_lpips.pth"
 export CHECKPOINT_INTERIOR="$(pwd)/checkpoints/may26_interior_w32_b4_4gpu_ep35_inference.pth"
 export CHECKPOINT_EXTERIOR="$(pwd)/checkpoints/may26_exterior_w32_b4_4gpu_ep29_inference.pth"

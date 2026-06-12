@@ -43,7 +43,7 @@ RUN python -m pip install --upgrade pip \
 COPY pipeline/ /workspace/pipeline/
 ENV AREM_REPO=/workspace/pipeline \
     UPRIGHT_REPO=/workspace/pipeline \
-    CLASSIFIER_PATH=/workspace/pipeline/classifier_v3.pth
+    CLASSIFIER_PATH=/workspace/pipeline/classifier_v4.pth
 
 ENV CHECKPOINT_STAGE1=/workspace/checkpoints/stage1_jxl_v1_best_lpips.pth \
     CHECKPOINT_INTERIOR=/workspace/checkpoints/may26_interior_w32_b4_4gpu_ep35_inference.pth \
