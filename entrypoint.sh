@@ -115,6 +115,11 @@ fetch "r2:arem-training-data/models/stage2/may26_interior_w32_b4_4gpu_ep35_infer
       "/workspace/checkpoints/may26_interior_w32_b4_4gpu_ep35_inference.pth"
 fetch "r2:arem-training-data/models/stage2/may26_exterior_w32_b4_4gpu_ep29_inference.pth" \
       "/workspace/checkpoints/may26_exterior_w32_b4_4gpu_ep29_inference.pth"
+# Room classifier v4 (ConvNeXt-Base full-frame, 350MB). Sets CLASSIFIER_ROOM
+# so the pipeline bakes roomType + confidence into EXIF + ImageReview.
+fetch "r2:arem-training-data/models/room_classifier_v4_native.pth" \
+      "/workspace/checkpoints/room_classifier_v4_native.pth"
+export CLASSIFIER_ROOM="/workspace/checkpoints/room_classifier_v4_native.pth"
 echo "[entrypoint] checkpoints ready"
 
 case "${MODE:-handler}" in

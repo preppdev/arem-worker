@@ -651,6 +651,27 @@ def load_room_classifier(ckpt_path: Path | None, device):
         print(f"  room classifier: skip (no ckpt at {ckpt_path})", flush=True)
         return None
     state = torch.load(str(ckpt_path), map_location=device, weights_only=False)
+
+    # ── v4: ConvNeXt-Base, full-frame letterbox, single room head ──────────
+    if state.get("arch") == "convnext_base" or "classes" in state:
+        classes = state["classes"]
+        model = tvmodels.convnext_base(weights=None)
+        model.classifier[2] = nn.Linear(model.classifier[2].in_features, len(classes))
+        model.load_state_dict(state["model"])
+        model.to(device).eval()
+        input_hw = tuple(state.get("input_hw") or (1365, 2048))
+        tfm = _LetterboxTfm(input_hw)
+        tta = state.get("tta") == "hflip"
+        version = state.get("version") or "v4"
+        print(
+            f"  Room classifier v4: {len(classes)} rooms ({classes}) "
+            f"acc={state.get('acc','?')} input=letterbox {input_hw} tta={'hflip' if tta else 'none'}",
+            flush=True,
+        )
+        return {"kind": "v4", "model": model, "classes": classes, "tfm": tfm,
+                "tta": tta, "version": version}
+
+    # ── legacy: TwoHead ResNet-18 @224 ─────────────────────────────────────
     room_types = state["room_types"]
     occupancies = state["occupancies"]
     model = _RoomTwoHead(n_rooms=len(room_types), n_occ=len(occupancies))
@@ -667,17 +688,38 @@ def load_room_classifier(ckpt_path: Path | None, device):
         f"{len(occupancies)} occupancies ({occupancies}), ver={version}",
         flush=True,
     )
-    return model, room_types, occupancies, tfm, version
+    return {"kind": "twohead", "model": model, "room_types": room_types,
+            "occupancies": occupancies, "tfm": tfm, "version": version}
 
 
 def classify_room(room_model, jpg_path: Path, device) -> dict | None:
-    """Run the room/occupancy classifier on `jpg_path`. Returns a dict with
-    roomType/confidence/occupancy or None when no model is loaded."""
+    """Run the room classifier on `jpg_path`. Returns roomType/roomConfidence/
+    occupancy/roomDistribution/version, or None when no model is loaded."""
     if room_model is None:
         return None
-    model, room_types, occupancies, tfm, version = room_model
     im = Image.open(jpg_path).convert("RGB")
-    x = tfm(im).unsqueeze(0).to(device)
+    x = room_model["tfm"](im).unsqueeze(0).to(device)
+
+    if room_model["kind"] == "v4":
+        classes = room_model["classes"]
+        with torch.no_grad():
+            logits = room_model["model"](x)
+            if room_model["tta"]:
+                logits = logits + room_model["model"](torch.flip(x, dims=[3]))
+            probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+        r_idx = int(probs.argmax())
+        return {
+            "roomType": classes[r_idx],
+            "roomConfidence": float(probs[r_idx]),
+            "occupancy": "unknown",
+            "occupancyConfidence": None,
+            "roomDistribution": {n: float(p) for n, p in zip(classes, probs)},
+            "version": room_model["version"],
+        }
+
+    # legacy two-head
+    model = room_model["model"]
+    room_types, occupancies = room_model["room_types"], room_model["occupancies"]
     with torch.no_grad():
         occ_logits, room_logits = model(x)
         room_probs = torch.softmax(room_logits, dim=1).cpu().numpy()[0]
@@ -690,7 +732,7 @@ def classify_room(room_model, jpg_path: Path, device) -> dict | None:
         "occupancy": occupancies[o_idx],
         "occupancyConfidence": float(occ_probs[o_idx]),
         "roomDistribution": {n: float(p) for n, p in zip(room_types, room_probs)},
-        "version": version,
+        "version": room_model["version"],
     }
 
 

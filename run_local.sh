@@ -39,6 +39,10 @@ mkdir -p "$WORK_ROOT"
 export AREM_REPO="$(pwd)/pipeline"
 export UPRIGHT_REPO="$(pwd)/pipeline"
 export CLASSIFIER_PATH="$(pwd)/pipeline/classifier_v4.pth"
+# Room classifier v4 (ConvNeXt-Base, full-frame letterbox 1365x2048, acc 0.888).
+# Large (350MB) so it lives in ~/models on the fleet nodes, not the repo.
+# Informational for now: bakes roomType + confidence into EXIF + ImageReview.
+export CLASSIFIER_ROOM="${CLASSIFIER_ROOM:-$HOME/models/room_classifier_v4_native.pth}"
 export CHECKPOINT_STAGE1="$(pwd)/checkpoints/stage1_jxl_v1_best_lpips.pth"
 export CHECKPOINT_INTERIOR="$(pwd)/checkpoints/may26_interior_w32_b4_4gpu_ep35_inference.pth"
 export CHECKPOINT_EXTERIOR="$(pwd)/checkpoints/may26_exterior_w32_b4_4gpu_ep29_inference.pth"
