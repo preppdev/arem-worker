@@ -60,37 +60,65 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--drone-dir", required=True)
     ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--model", required=True)
+    ap.add_argument("--model", default=None)  # required only when DNGs are present
     ap.add_argument("--quality", type=int, default=92)
     a = ap.parse_args()
     os.makedirs(a.out_dir, exist_ok=True)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    ck = torch.load(a.model, map_location=device, weights_only=False)
-    model = NAFNet(in_channels=3, out_channels=3, width=int(ck.get("width", 32)),
-                   middle_blk_num=12, enc_blk_nums=[2, 2, 4, 8], dec_blk_nums=[2, 2, 2, 2],
-                   use_residual=True, residual_start=int(ck.get("residual_start", 0))).to(device).eval()
-    model.load_state_dict(ck["model"])
-    print(f"drone_finish: model val_l1={ck.get('val_l1')} device={device}", flush=True)
+    # Map stem -> path for each kind. Mixed-input rules (per shoot, per stem):
+    #   - DNG present            → develop + grade it (a paired JPG is ignored)
+    #   - JPG with no companion DNG → pass through unedited (copy as-is)
+    #   - only JPGs              → all pass through
+    # Only DNGs are ever edited; everything lands in --out-dir/<stem>.jpg.
+    def gather(exts):
+        out = {}
+        for e in exts:
+            for p in glob.glob(os.path.join(a.drone_dir, "*." + e)):
+                out[os.path.splitext(os.path.basename(p))[0]] = p
+        return out
+    dngs = gather(["dng", "DNG"])
+    jpgs = gather(["jpg", "JPG", "jpeg", "JPEG"])
+    print(f"drone_finish: {len(dngs)} DNG(s), {len(jpgs)} JPG(s)", flush=True)
 
-    dngs = sorted(set(glob.glob(os.path.join(a.drone_dir, "*.dng")) +
-                      glob.glob(os.path.join(a.drone_dir, "*.DNG"))))
-    print(f"drone_finish: {len(dngs)} DNG(s)", flush=True)
-    ok = 0
-    for p in dngs:
-        stem = os.path.splitext(os.path.basename(p))[0]
+    model = None
+    if dngs:
+        if not a.model or not os.path.isfile(a.model):
+            print("  WARN DNGs present but no model — cannot develop; passing through JPGs only", flush=True)
+        else:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            ck = torch.load(a.model, map_location=device, weights_only=False)
+            model = NAFNet(in_channels=3, out_channels=3, width=int(ck.get("width", 32)),
+                           middle_blk_num=12, enc_blk_nums=[2, 2, 4, 8], dec_blk_nums=[2, 2, 2, 2],
+                           use_residual=True, residual_start=int(ck.get("residual_start", 0))).to(device).eval()
+            model.load_state_dict(ck["model"])
+            print(f"  model val_l1={ck.get('val_l1')} device={device}", flush=True)
+
+    edited = passed = 0
+    if model:
+        device = next(model.parameters()).device.type
+        for stem, p in sorted(dngs.items()):
+            try:
+                dev = develop(p).astype(np.float32)
+                delta = grade_delta(model, dev.astype(np.uint8), device)
+                out = np.clip(dev + delta, 0, 255).astype(np.uint8)
+                outp = os.path.join(a.out_dir, f"{stem}.jpg")
+                cv2.imwrite(outp, out, [cv2.IMWRITE_JPEG_QUALITY, a.quality])
+                copy_exif(p, outp)
+                edited += 1
+                print(f"  edit {stem} ({out.shape[1]}x{out.shape[0]})", flush=True)
+            except Exception as e:
+                print(f"  ERR {stem}: {str(e)[:120]}", flush=True)
+    # pass-through: JPGs with no companion DNG, copied byte-for-byte (no re-encode)
+    for stem, p in sorted(jpgs.items()):
+        if stem in dngs:
+            continue  # paired with a DNG → ignore the JPG, only the DNG is edited
         try:
-            dev = develop(p).astype(np.float32)
-            delta = grade_delta(model, dev.astype(np.uint8), device)
-            out = np.clip(dev + delta, 0, 255).astype(np.uint8)
-            outp = os.path.join(a.out_dir, f"{stem}.jpg")
-            cv2.imwrite(outp, out, [cv2.IMWRITE_JPEG_QUALITY, a.quality])
-            copy_exif(p, outp)
-            ok += 1
-            print(f"  ok {stem} ({out.shape[1]}x{out.shape[0]})", flush=True)
+            shutil.copy2(p, os.path.join(a.out_dir, f"{stem}.jpg"))
+            passed += 1
+            print(f"  pass {stem}", flush=True)
         except Exception as e:
-            print(f"  ERR {stem}: {str(e)[:120]}", flush=True)
-    print(f"DRONE_FINISH_OUTPUTS {ok}/{len(dngs)}", flush=True)
+            print(f"  ERR passthrough {stem}: {str(e)[:120]}", flush=True)
+    print(f"DRONE_FINISH_OUTPUTS edited={edited} passthrough={passed} (dng={len(dngs)} jpg={len(jpgs)})", flush=True)
 
 if __name__ == "__main__":
     main()

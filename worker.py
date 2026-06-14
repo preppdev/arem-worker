@@ -844,23 +844,26 @@ def process_drone(dropbox_path: str, work: Path) -> int:
     completes on its interior outputs. Returns the count of drone JPGs produced.
     """
     src = f"{dropbox_path}/{DRONE_SUBFOLDER}"
-    ls = rclone(["lsf", src, "--include", "*.dng", "--include", "*.DNG"], timeout=120)
+    # Drone stills come as DNG, DNG+JPG pairs, or bare JPGs. Pull every still;
+    # drone_finish develops DNGs and passes lone JPGs through unedited.
+    inc = ["--include", "*.dng", "--include", "*.DNG", "--include", "*.jpg",
+           "--include", "*.JPG", "--include", "*.jpeg", "--include", "*.JPEG"]
+    ls = rclone(["lsf", src, *inc], timeout=120)
     if ls.returncode != 0 or not ls.stdout.strip():
-        return 0  # no drone DNGs on this shoot
+        return 0  # no drone stills on this shoot
+    has_dng = any(n.strip().lower().endswith(".dng") for n in ls.stdout.splitlines())
     ddir = work / "drone_raw"; ddir.mkdir(parents=True, exist_ok=True)
-    rclone(["copy", src, str(ddir), "--include", "*.dng", "--include", "*.DNG",
-            "--transfers", "6", "--progress=false"], timeout=1800)
-    dngs = list(ddir.glob("*.dng")) + list(ddir.glob("*.DNG"))
-    if not dngs:
-        return 0
-    model = _ensure_polish_ckpt(DRONE_MODEL_R2KEY)  # reuse the ckpt download+cache
-    if not model:
-        log("  WARN drone model unavailable; skipping drone develop")
-        return 0
+    rclone(["copy", src, str(ddir), *inc, "--transfers", "6", "--progress=false"], timeout=1800)
     odir = work / "drone_out"; odir.mkdir(parents=True, exist_ok=True)
     cmd = [PYTHON_BIN, str(AREM_REPO / "drone_finish.py"),
-           "--drone-dir", str(ddir), "--out-dir", str(odir), "--model", str(model)]
-    log(f"  drone: {len(dngs)} DNG(s) → develop+finish")
+           "--drone-dir", str(ddir), "--out-dir", str(odir)]
+    if has_dng:  # only fetch the grade model when there's something to develop
+        model = _ensure_polish_ckpt(DRONE_MODEL_R2KEY)  # reuse the ckpt download+cache
+        if model:
+            cmd += ["--model", str(model)]
+        else:
+            log("  WARN drone model unavailable; DNGs skipped, JPGs passed through")
+    log("  drone: develop DNGs + pass-through lone JPGs")
     rr = subprocess.run(cmd, capture_output=True, text=True, timeout=2 * 3600)
     if rr.stdout:
         log(rr.stdout[-1000:])
