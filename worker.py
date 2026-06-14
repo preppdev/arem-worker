@@ -298,6 +298,10 @@ def rclone(args: list[str], timeout: int = 1800) -> subprocess.CompletedProcess:
 # fallback names. If a folder doesn't have 01-RAW-Photos/, that's a data
 # problem to surface — not a routing question.
 RAW_SUBFOLDER = "01-RAW-Photos"
+# Drone DNGs live here; their developed+finished JPGs go to a sibling edited/
+# subfolder that the delivery gallery serves in place of the raw camera JPG.
+DRONE_SUBFOLDER = "04-RAW-Drone-Other"
+DRONE_MODEL_R2KEY = os.environ.get("DRONE_MODEL_R2KEY", "models/drone-finish/best.pt")
 # Image formats we accept as bracket inputs. RAW formats hit rawpy +
 # lensfun (Sony ARW, Nikon NEF, Canon CR2/CR3, plus generic DNG/RAF/RW2).
 # Everything else (JPG/JPEG/TIFF/PNG/JXL/WEBP) gets decoded directly via
@@ -829,6 +833,53 @@ def upload_manual_outputs(local_dir: Path, output_prefix: str) -> tuple[int, lis
 
 
 # ---- per-job orchestrator ----
+def process_drone(dropbox_path: str, work: Path) -> int:
+    """Develop + finish drone DNGs the way camera RAWs are processed.
+
+    For each DNG in <shoot>/04-RAW-Drone-Other: rawpy develop → NAFNet grade
+    model → full-resolution JPG (GPS preserved), uploaded to
+    04-RAW-Drone-Other/edited/. The delivery gallery serves the edited version
+    in place of the raw camera JPG (and surfaces RAW-only drone shots that have
+    no camera JPG at all). Best-effort: any failure is logged and the job still
+    completes on its interior outputs. Returns the count of drone JPGs produced.
+    """
+    src = f"{dropbox_path}/{DRONE_SUBFOLDER}"
+    ls = rclone(["lsf", src, "--include", "*.dng", "--include", "*.DNG"], timeout=120)
+    if ls.returncode != 0 or not ls.stdout.strip():
+        return 0  # no drone DNGs on this shoot
+    ddir = work / "drone_raw"; ddir.mkdir(parents=True, exist_ok=True)
+    rclone(["copy", src, str(ddir), "--include", "*.dng", "--include", "*.DNG",
+            "--transfers", "6", "--progress=false"], timeout=1800)
+    dngs = list(ddir.glob("*.dng")) + list(ddir.glob("*.DNG"))
+    if not dngs:
+        return 0
+    model = _ensure_polish_ckpt(DRONE_MODEL_R2KEY)  # reuse the ckpt download+cache
+    if not model:
+        log("  WARN drone model unavailable; skipping drone develop")
+        return 0
+    odir = work / "drone_out"; odir.mkdir(parents=True, exist_ok=True)
+    cmd = [PYTHON_BIN, str(AREM_REPO / "drone_finish.py"),
+           "--drone-dir", str(ddir), "--out-dir", str(odir), "--model", str(model)]
+    log(f"  drone: {len(dngs)} DNG(s) → develop+finish")
+    rr = subprocess.run(cmd, capture_output=True, text=True, timeout=2 * 3600)
+    if rr.stdout:
+        log(rr.stdout[-1000:])
+    if rr.returncode != 0:
+        log(f"  WARN drone_finish rc={rr.returncode}: {rr.stderr[-300:]}")
+        return 0
+    jpgs = list(odir.glob("*.jpg"))
+    if not jpgs:
+        return 0
+    dst = f"{src}/edited"
+    up = rclone(["copy", str(odir), dst, "--include", "*.jpg",
+                 "--transfers", "8", "--progress=false"], timeout=1800)
+    if up.returncode != 0:
+        log(f"  WARN drone edited upload rc={up.returncode}: {up.stderr[-200:]}")
+        return 0
+    log(f"  drone: {len(jpgs)} developed JPG(s) → {DRONE_SUBFOLDER}/edited/")
+    return len(jpgs)
+
+
 def process_job(job: dict) -> dict:
     job_id = job["id"]
     stored_path = job["dropboxPath"]
@@ -980,6 +1031,17 @@ def process_job(job: dict) -> dict:
                     f"cf_images={n_cf}/{len(production_records)}")
             except Exception as e:
                 log(f"  WARN production dual-write: {str(e)[:200]}")
+
+    # ── Drone: develop + finish 04-RAW-Drone-Other DNGs (normal shoots only) ──
+    # Single-frame analogue of the interior pipeline. Make-ups re-edit interior
+    # frames only, and manual uploads have no shoot-folder structure, so drone
+    # processing runs on the shoot's first (normal) pass. Best-effort.
+    n_drone = 0
+    if not manual and not makeup:
+        try:
+            n_drone = process_drone(dropbox_path, work)
+        except Exception as e:
+            log(f"  WARN drone processing: {str(e)[:200]}")
 
     # Read _meta.json from the inference step to surface grouping failures
     # and peak VRAM. Each anchor that couldn't be paired is a data-hygiene
