@@ -63,7 +63,7 @@ R2_PRODUCTION_BUCKET = os.environ.get("R2_PRODUCTION_BUCKET", "arem-production-e
 R2_TRAINING_BUCKET = os.environ.get("R2_TRAINING_BUCKET", "arem-training-data")
 RCLONE_R2 = os.environ.get("RCLONE_R2", "r2")
 CAMTRIP_DETECTOR_PATH = os.environ.get(
-    "CAMTRIP_DETECTOR_PATH", "/home/jordan/models/camtrip_detector_v3_native.pth")
+    "CAMTRIP_DETECTOR_PATH", "/home/jordan/models/camtrip_detector_v4_native.pth")
 
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
