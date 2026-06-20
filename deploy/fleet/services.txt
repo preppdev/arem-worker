@@ -1,0 +1,8 @@
+# Worker services restarted (only when code/deps/models changed) to self-update.
+# Non-existent ones are skipped per node. Queue-based → a brief restart re-processes.
+arem-sky-swap
+arem-worker-local
+arem-enhancement-local
+arem-inpaint-sandbox
+arem-pretagger
+arem-video-render

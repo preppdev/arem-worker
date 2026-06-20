@@ -1,0 +1,12 @@
+[Unit]
+Description=AREM fleet self-heal (git pull + pinned deps + model heal + restart + verify + report)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=jordan
+EnvironmentFile=-/etc/arem-worker.env
+WorkingDirectory=/home/jordan/arem-worker
+ExecStart=/bin/bash /home/jordan/arem-worker/fleet_selfheal.sh
+TimeoutStartSec=900

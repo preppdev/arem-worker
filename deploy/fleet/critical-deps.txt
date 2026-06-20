@@ -1,0 +1,6 @@
+# Critical pip deps the fleet workers MUST have, PINNED (no surprise upgrades).
+# fleet_selfheal.sh reconciles to exactly these daily. Add a line when a missing
+# dep is found to silently break a worker (the way onnxruntime/pymatting did on
+# Compute-2, 2026-06-20).
+onnxruntime==1.26.0
+pymatting==1.1.15
