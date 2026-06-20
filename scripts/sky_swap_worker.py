@@ -391,6 +391,28 @@ def main() -> int:
     ap.add_argument("--idle-unload-sec", type=int,
                     default=int(os.environ.get("SKYSWAP_IDLE_UNLOAD_SEC", "300")))
     args = ap.parse_args()
+
+    # Preflight self-check: refuse to run (and claim jobs) if the sky-seg
+    # dependencies aren't present on THIS node. Without this, a node missing
+    # onnxruntime or the model silently fails every frame it pulls from the
+    # shared queue — ~60% of fleet sky-swaps were lost this way (Compute-2,
+    # 2026-06-20) with no dashboard signal. Exit non-zero so systemd marks the
+    # service FAILED and the breakage is visible. Set SKYSWAP_SKIP_PREFLIGHT=1
+    # to bypass (e.g. a node intentionally not running swaps).
+    if os.environ.get("SKYSWAP_SKIP_PREFLIGHT", "").lower() not in ("1", "true", "yes"):
+        try:
+            import onnxruntime  # noqa: F401  # type: ignore
+        except Exception as e:
+            log(f"[skyswap] PREFLIGHT FAIL: onnxruntime not importable ({e}). "
+                f"`pip install onnxruntime==1.26.0` in this env. Exiting.")
+            return 3
+        from scripts.sky_replace_v9_baseline import SKYSEG_ONNX  # type: ignore
+        if not Path(SKYSEG_ONNX).is_file():
+            log(f"[skyswap] PREFLIGHT FAIL: sky model missing at {SKYSEG_ONNX}. "
+                f"Copy it from a healthy node (~/sky_models/). Exiting.")
+            return 4
+        log("[skyswap] preflight OK (onnxruntime + sky model present)")
+
     with tempfile.TemporaryDirectory(prefix="arem-skyswap-") as sd:
         scratch = Path(sd)
         if not args.loop:
