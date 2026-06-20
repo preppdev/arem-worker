@@ -411,7 +411,15 @@ def main() -> int:
             log(f"[skyswap] PREFLIGHT FAIL: sky model missing at {SKYSEG_ONNX}. "
                 f"Copy it from a healthy node (~/sky_models/). Exiting.")
             return 4
-        log("[skyswap] preflight OK (onnxruntime + sky model present)")
+        # pymatting is a SOFT dep — without it the swap still completes but falls
+        # back to a coarse alpha (rougher sky edges). Warn loudly but don't exit,
+        # so a node degrades visibly rather than silently shipping lower quality.
+        try:
+            import pymatting  # noqa: F401  # type: ignore
+            log("[skyswap] preflight OK (onnxruntime + sky model + pymatting present)")
+        except Exception:
+            log("[skyswap] preflight WARN: pymatting missing — swaps will use the "
+                "COARSE alpha fallback (lower edge quality). `pip install pymatting==1.1.15`.")
 
     with tempfile.TemporaryDirectory(prefix="arem-skyswap-") as sd:
         scratch = Path(sd)
