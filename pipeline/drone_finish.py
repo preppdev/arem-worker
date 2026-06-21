@@ -99,6 +99,45 @@ def main():
     jpgs = gather(["jpg", "JPG", "jpeg", "JPEG"])
     print(f"drone_finish: {len(dngs)} DNG(s), {len(jpgs)} JPG(s)", flush=True)
 
+    # ── TEMPORARY model bypass (DRONE_BYPASS_MODEL=1) ─────────────────────────
+    # The learned drone grade is producing blurred/over-processed output, so
+    # while it's being fixed we ship the camera's own finished frame instead of
+    # running the model. Per DNG: use the companion camera JPG if one sits beside
+    # it; otherwise fall back to a clean rawpy develop (sharp, just ungraded).
+    # Toggle off by unsetting the env — no code change needed.
+    if os.environ.get("DRONE_BYPASS_MODEL", "").strip().lower() in ("1", "true", "yes", "on"):
+        print("  DRONE_BYPASS_MODEL set — model DISABLED; using camera JPG beside each DNG "
+              "(clean develop where none exists)", flush=True)
+        jpg_pass = develop_pass = 0
+        for stem, dng in sorted(dngs.items()):
+            outp = os.path.join(a.out_dir, f"{stem}.jpg")
+            if stem in jpgs:  # companion camera JPG → ship it as-is
+                try:
+                    shutil.copy2(jpgs[stem], outp); jpg_pass += 1
+                    print(f"  jpg-beside {stem}", flush=True)
+                except Exception as e:
+                    print(f"  ERR jpg-beside {stem}: {str(e)[:120]}", flush=True)
+            else:  # DNG-only → clean develop, no model grade
+                try:
+                    cv2.imwrite(outp, develop(dng), [cv2.IMWRITE_JPEG_QUALITY, a.quality])
+                    copy_exif(dng, outp); develop_pass += 1
+                    print(f"  clean-develop {stem}", flush=True)
+                except Exception as e:
+                    print(f"  ERR develop {stem}: {str(e)[:120]}", flush=True)
+        # lone JPGs (no DNG) still pass through as before
+        lone = 0
+        for stem, p in sorted(jpgs.items()):
+            if stem in dngs:
+                continue
+            try:
+                shutil.copy2(p, os.path.join(a.out_dir, f"{stem}.jpg")); lone += 1
+            except Exception as e:
+                print(f"  ERR passthrough {stem}: {str(e)[:120]}", flush=True)
+        print(f"DRONE_FINISH_OUTPUTS edited=0 passthrough={jpg_pass + develop_pass + lone} "
+              f"(BYPASS: jpg-beside={jpg_pass} clean-develop={develop_pass} lone-jpg={lone}) "
+              f"(dng={len(dngs)} jpg={len(jpgs)})", flush=True)
+        return
+
     model = None
     if dngs:
         if not a.model or not os.path.isfile(a.model):
