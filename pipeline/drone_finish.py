@@ -46,7 +46,26 @@ def grade_delta(model, dev_bgr, device):
     o = (out[0].permute(1, 2, 0).cpu().numpy() * 255)[:, :, ::-1]  # BGR float
     o = o[:sh, :sw]
     delta_small = o - small  # residual grade at small scale
+    # The grade is MEANT to be a smooth tonal/color delta (see module docstring),
+    # but NAFNet is a restoration net — on texture-heavy frames (dense foliage)
+    # it also denoises fine detail, which shows up as high-frequency content in
+    # the delta. Computed at WORK_LONG and bilinearly upscaled ~2.5x to native,
+    # that detail-removal map is misaligned against the sharp full-res develop and
+    # subtracts smeared detail → a "tilt-shift" blur on the textured regions while
+    # low-frequency subjects (roof, pool, pavement) survive. Low-pass the delta so
+    # only the smooth grade is applied at native res and ALL fine detail comes from
+    # `dev`. sigma is set in small-scale px; INTER_AREA downscale already removed
+    # detail finer than ~1px, so this targets the 1–8px band the upscale smears.
+    sigma = max(1.5, WORK_LONG / 512.0)  # ~4px at 2048
+    delta_small = cv2.GaussianBlur(delta_small, (0, 0), sigmaX=sigma, sigmaY=sigma)
     return cv2.resize(delta_small, (W, H), interpolation=cv2.INTER_LINEAR)
+
+
+def _sharpness(bgr):
+    """Relative high-frequency energy (variance of Laplacian on luma). Cheap
+    blur metric — higher = sharper."""
+    g = cv2.cvtColor(bgr.astype(np.uint8), cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(g, cv2.CV_64F).var())
 
 def copy_exif(dng, jpg):
     """Best-effort GPS + orientation passthrough from the DNG."""
@@ -101,6 +120,16 @@ def main():
                 dev = develop(p).astype(np.float32)
                 delta = grade_delta(model, dev.astype(np.uint8), device)
                 out = np.clip(dev + delta, 0, 255).astype(np.uint8)
+                # Safety net: a finished frame should never be materially blurrier
+                # than its own develop. If it is (a grade artifact slipped through),
+                # ship the clean develop rather than a blurred edit. We'd rather
+                # deliver an ungraded-but-sharp frame than a smeared one.
+                dev_u8 = dev.astype(np.uint8)
+                s_out, s_dev = _sharpness(out), _sharpness(dev_u8)
+                if s_dev > 0 and s_out < 0.6 * s_dev:
+                    print(f"  GUARD {stem}: edit blurrier than develop "
+                          f"({s_out:.0f} < 0.6*{s_dev:.0f}) — shipping develop", flush=True)
+                    out = dev_u8
                 outp = os.path.join(a.out_dir, f"{stem}.jpg")
                 cv2.imwrite(outp, out, [cv2.IMWRITE_JPEG_QUALITY, a.quality])
                 copy_exif(p, outp)
