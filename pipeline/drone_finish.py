@@ -55,9 +55,36 @@ def gentle_finish(bgr, dehaze=0.12, contrast=0.10, vibrance=0.22, warmth=0.012,
     img = np.clip(img + sharpen * (img - cv2.GaussianBlur(img, (0, 0), 1.0)), 0, 1)
     return (img * 255).astype(np.uint8)
 
+def clarity(bgr, clar=0.18, sharp=0.45):
+    """Unsharp clarity + sharpen pass — adds the dngoutput 'pop' after the NAFNet
+    color/tone pass. Spatial but ONLY adds sharpness; cannot blur."""
+    img = bgr.astype(np.float32) / 255.0
+    img = np.clip(img + clar * (img - cv2.GaussianBlur(img, (0, 0), 4)), 0, 1)
+    img = np.clip(img + sharp * (img - cv2.GaussianBlur(img, (0, 0), 1.0)), 0, 1)
+    return (img * 255).astype(np.uint8)
+
+def to_12mp(bgr):
+    """Delivery resolution = 12 MP (matches every other AREM photo). Downscale
+    (preserve aspect) if larger; leave as-is if already <=12 MP."""
+    H, W = bgr.shape[:2]
+    if H * W <= 12_000_000:
+        return bgr
+    s = (12_000_000 / (H * W)) ** 0.5
+    return cv2.resize(bgr, (round(W * s), round(H * s)), interpolation=cv2.INTER_AREA)
+
+def nafnet_finish(model, dev_bgr_12mp, device):
+    """Production drone finish (drone_finish_v2): NAFNet v2 color/tone in a SINGLE
+    12 MP pass — no tiling, no residual-upscale (the delta-upscale in grade_delta
+    is what smeared foliage) — then a deterministic clarity pass for the pop.
+    Output sharpness >= input; blur is structurally impossible."""
+    x = torch.from_numpy(dev_bgr_12mp[:, :, ::-1].copy()).permute(2, 0, 1).float().div(255).unsqueeze(0).to(device)
+    with torch.inference_mode():
+        o = torch.clamp(model(x), 0, 1)[0].permute(1, 2, 0).cpu().numpy()[:, :, ::-1]
+    return clarity(np.clip(o * 255, 0, 255).astype(np.uint8))
+
 def grade_delta(model, dev_bgr, device):
-    """Run the model at WORK_LONG and return the residual grade delta (float BGR,
-    -255..255) at the SAME size as dev_bgr (delta computed small, upscaled)."""
+    """LEGACY (smeared foliage; superseded by nafnet_finish). Run the model at
+    WORK_LONG and return the residual grade delta upscaled to dev_bgr size."""
     H, W = dev_bgr.shape[:2]
     scale = WORK_LONG / max(H, W)
     sw, sh = max(16, int(round(W * scale))), max(16, int(round(H * scale)))
@@ -187,15 +214,15 @@ def main():
     device = next(model.parameters()).device.type if model else None
     for stem, p in sorted(dngs.items()):
         try:
-            dev = develop(p).astype(np.float32)
+            dev = develop(p)
             if model:
-                out = np.clip(dev + grade_delta(model, dev.astype(np.uint8), device), 0, 255).astype(np.uint8)
+                base = to_12mp(dev)                       # deliver at 12 MP
+                out = nafnet_finish(model, base, device)  # NAFNet v2 color + clarity, single pass
                 # Safety net: never ship a frame materially blurrier than its
-                # develop — fall back to the clean develop if the model regresses.
-                dev_u8 = dev.astype(np.uint8)
-                if _sharpness(dev_u8) > 0 and _sharpness(out) < 0.6 * _sharpness(dev_u8):
+                # develop — fall back to the clean 12 MP develop if it regresses.
+                if _sharpness(base) > 0 and _sharpness(out) < 0.6 * _sharpness(base):
                     print(f"  GUARD {stem}: edit blurrier than develop — shipping develop", flush=True)
-                    out = dev_u8
+                    out = base
             else:
                 out = gentle_finish(dev.astype(np.uint8))
             outp = os.path.join(a.out_dir, f"{stem}.jpg")

@@ -301,7 +301,7 @@ RAW_SUBFOLDER = "01-RAW-Photos"
 # Drone DNGs live here; their developed+finished JPGs go to a sibling edited/
 # subfolder that the delivery gallery serves in place of the raw camera JPG.
 DRONE_SUBFOLDER = "04-RAW-Drone-Other"
-DRONE_MODEL_R2KEY = os.environ.get("DRONE_MODEL_R2KEY", "models/drone-finish/best.pt")
+DRONE_MODEL_R2KEY = os.environ.get("DRONE_MODEL_R2KEY", "models/drone-finish/nafnet_v2.pt")
 # Image formats we accept as bracket inputs. RAW formats hit rawpy +
 # lensfun (Sony ARW, Nikon NEF, Canon CR2/CR3, plus generic DNG/RAF/RW2).
 # Everything else (JPG/JPEG/TIFF/PNG/JXL/WEBP) gets decoded directly via

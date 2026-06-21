@@ -19,14 +19,26 @@ Saves best-val checkpoint to <out_ckpt>.
 import os, sys, glob, time, argparse, random
 import numpy as np, cv2, torch, torch.nn as nn, torch.nn.functional as F
 
+cv2.setNumThreads(0)  # OpenCV is not fork-safe; disable its threads for DataLoader workers
+
+def imread(path):
+    """Fork-safe JPEG read: bytes via numpy (Python I/O), decode in-memory.
+    cv2.imread() opens the file in OpenCV's C++ layer, which fails inside forked
+    DataLoader workers; np.fromfile + imdecode avoids that path."""
+    buf = np.fromfile(path, dtype=np.uint8)
+    img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    if img is None:
+        raise RuntimeError(f"failed to decode {path} ({buf.size} bytes)")
+    return img
+
 # ───────────────────────── data ─────────────────────────
 class Pairs(torch.utils.data.Dataset):
     def __init__(self, stems, pairs_dir, crop=None, full=None):
         self.stems, self.dir, self.crop, self.full = stems, pairs_dir, crop, full
     def __len__(self): return len(self.stems)
     def _load(self, stem):
-        a = cv2.imread(os.path.join(self.dir, f"{stem}_in.jpg"))
-        b = cv2.imread(os.path.join(self.dir, f"{stem}_tgt.jpg"))
+        a = imread(os.path.join(self.dir, f"{stem}_in.jpg"))
+        b = imread(os.path.join(self.dir, f"{stem}_tgt.jpg"))
         if a.shape[:2] != b.shape[:2]:
             b = cv2.resize(b, (a.shape[1], a.shape[0]))
         return a, b
@@ -95,7 +107,7 @@ def main():
     ap.add_argument("--lr", type=float, default=2e-4)
     a = ap.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    stems = sorted(s[:-7] for s in os.listdir(a.pairs) if s.endswith("_tgt.jpg"))
+    stems = sorted(s[:-8] for s in os.listdir(a.pairs) if s.endswith("_tgt.jpg"))  # strip "_tgt.jpg" (8 chars)
     random.Random(0).shuffle(stems)
     val, train = stems[:20], stems[20:]
     print(f"{len(train)} train / {len(val)} val | model={a.model} dev={dev}", flush=True)
