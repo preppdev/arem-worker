@@ -72,15 +72,22 @@ def to_12mp(bgr):
     s = (12_000_000 / (H * W)) ** 0.5
     return cv2.resize(bgr, (round(W * s), round(H * s)), interpolation=cv2.INTER_AREA)
 
-def nafnet_finish(model, dev_bgr_12mp, device):
-    """Production drone finish (drone_finish_v2): NAFNet v2 color/tone in a SINGLE
-    12 MP pass — no tiling, no residual-upscale (the delta-upscale in grade_delta
-    is what smeared foliage) — then a deterministic clarity pass for the pop.
-    Output sharpness >= input; blur is structurally impossible."""
+def nafnet_finish(model, dev_bgr_12mp, device, grade_sigma=3.0):
+    """Production drone finish (drone_finish_v2), DETAIL-PRESERVING.
+
+    NAFNet is a dense conv net — applied directly it smooths fine micro-texture
+    (shingle granules, foliage), losing detail vs the camera JPG even though the
+    color grade is right. So we DON'T ship its pixels. We take only its smooth,
+    spatially-adaptive COLOR GRADE — low-pass(NAFNet(develop) - develop) — and add
+    that to the SHARP develop, then a deterministic clarity pass. Result: the
+    develop's full native detail + the learned dngoutput grade + pop, with no
+    smoothing. Output detail == develop detail by construction."""
+    base = dev_bgr_12mp.astype(np.float32)
     x = torch.from_numpy(dev_bgr_12mp[:, :, ::-1].copy()).permute(2, 0, 1).float().div(255).unsqueeze(0).to(device)
     with torch.inference_mode():
-        o = torch.clamp(model(x), 0, 1)[0].permute(1, 2, 0).cpu().numpy()[:, :, ::-1]
-    return clarity(np.clip(o * 255, 0, 255).astype(np.uint8))
+        graded = torch.clamp(model(x), 0, 1)[0].permute(1, 2, 0).cpu().numpy()[:, :, ::-1] * 255.0
+    grade_lf = cv2.GaussianBlur(graded - base, (0, 0), sigmaX=grade_sigma, sigmaY=grade_sigma)
+    return clarity(np.clip(base + grade_lf, 0, 255).astype(np.uint8))
 
 def grade_delta(model, dev_bgr, device):
     """LEGACY (smeared foliage; superseded by nafnet_finish). Run the model at
