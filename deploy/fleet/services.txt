@@ -7,3 +7,4 @@ arem-inpaint-sandbox
 arem-pretagger
 arem-video-render
 arem-preview
+arem-reprocess

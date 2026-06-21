@@ -1,0 +1,16 @@
+[Unit]
+Description=AREM reprocess worker (single-image forced-scene re-run from the delivery gallery)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jordan
+EnvironmentFile=-/etc/arem-worker.env
+WorkingDirectory=/home/jordan/arem-worker
+ExecStart=/bin/bash /home/jordan/arem-worker/run_reprocess.sh
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
