@@ -1,0 +1,16 @@
+[Unit]
+Description=AREM preview worker (warm single-frame enhance for the uploader app)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jordan
+EnvironmentFile=-/etc/arem-worker.env
+WorkingDirectory=/home/jordan/arem-worker
+ExecStart=/bin/bash /home/jordan/arem-worker/run_preview.sh
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
