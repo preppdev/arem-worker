@@ -30,6 +30,31 @@ def develop(dng_path):
                               output_bps=8, user_flip=-1)
     return np.ascontiguousarray(dev[:, :, ::-1])  # RGB -> BGR
 
+
+def gentle_finish(bgr, dehaze=0.12, contrast=0.10, vibrance=0.22, warmth=0.012,
+                  clarity=0.10, sharpen=0.30):
+    """Deterministic tone/style finish — the AREM drone look as global tone +
+    color + local-CONTRAST only. Warmth (R/B trim), dehaze (mild CLAHE blend on
+    L), contrast, vibrance, then two unsharp passes (clarity @sigma4, sharpen
+    @sigma1). Every spatial op here ADDS sharpness; nothing blurs. This is the
+    original v1 target the NAFNet was trained to imitate — used directly so the
+    finish can't smear. Input + output are BGR uint8 at native resolution."""
+    img = bgr.astype(np.float32) / 255.0
+    img[..., 2] = np.clip(img[..., 2] * (1 + warmth), 0, 1)
+    img[..., 0] = np.clip(img[..., 0] * (1 - warmth), 0, 1)
+    lab = cv2.cvtColor((img * 255).astype(np.uint8), cv2.COLOR_BGR2LAB)
+    L, a, b = cv2.split(lab)
+    L = cv2.addWeighted(L, 1 - dehaze, cv2.createCLAHE(1.0 + dehaze * 3, (8, 8)).apply(L), dehaze, 0)
+    img = cv2.cvtColor(cv2.merge([L, a, b]), cv2.COLOR_LAB2BGR).astype(np.float32) / 255.0
+    img = np.clip((img - 0.5) * (1 + contrast) + 0.5, 0, 1)
+    hsv = cv2.cvtColor((img * 255).astype(np.uint8), cv2.COLOR_BGR2HSV).astype(np.float32)
+    s = hsv[..., 1] / 255.0
+    hsv[..., 1] = np.clip((s + vibrance * (1 - s) * s) * 255, 0, 255)
+    img = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32) / 255.0
+    img = np.clip(img + clarity * (img - cv2.GaussianBlur(img, (0, 0), 4)), 0, 1)
+    img = np.clip(img + sharpen * (img - cv2.GaussianBlur(img, (0, 0), 1.0)), 0, 1)
+    return (img * 255).astype(np.uint8)
+
 def grade_delta(model, dev_bgr, device):
     """Run the model at WORK_LONG and return the residual grade delta (float BGR,
     -255..255) at the SAME size as dev_bgr (delta computed small, upscaled)."""
@@ -138,10 +163,15 @@ def main():
               f"(dng={len(dngs)} jpg={len(jpgs)})", flush=True)
         return
 
+    # Finish mode. DEFAULT = gentle_finish (deterministic tone/style; can't blur).
+    # The NAFNet model path is opt-in via DRONE_USE_NAFNET=1 — kept so a retrained,
+    # better-constrained model can be A/B'd without a code change. The old model is
+    # NOT the default because its residual-upscale smears foliage (see grade_delta).
+    use_nafnet = os.environ.get("DRONE_USE_NAFNET", "").strip().lower() in ("1", "true", "yes", "on")
     model = None
-    if dngs:
+    if use_nafnet and dngs:
         if not a.model or not os.path.isfile(a.model):
-            print("  WARN DNGs present but no model — cannot develop; passing through JPGs only", flush=True)
+            print("  WARN DRONE_USE_NAFNET set but no model file — falling back to gentle_finish", flush=True)
         else:
             device = "cuda" if torch.cuda.is_available() else "cpu"
             ck = torch.load(a.model, map_location=device, weights_only=False)
@@ -149,33 +179,32 @@ def main():
                            middle_blk_num=12, enc_blk_nums=[2, 2, 4, 8], dec_blk_nums=[2, 2, 2, 2],
                            use_residual=True, residual_start=int(ck.get("residual_start", 0))).to(device).eval()
             model.load_state_dict(ck["model"])
-            print(f"  model val_l1={ck.get('val_l1')} device={device}", flush=True)
+            print(f"  DRONE_USE_NAFNET: model val_l1={ck.get('val_l1')} device={device}", flush=True)
+    if not model:
+        print("  finish = gentle_finish (deterministic tone/style, no blur)", flush=True)
 
     edited = passed = 0
-    if model:
-        device = next(model.parameters()).device.type
-        for stem, p in sorted(dngs.items()):
-            try:
-                dev = develop(p).astype(np.float32)
-                delta = grade_delta(model, dev.astype(np.uint8), device)
-                out = np.clip(dev + delta, 0, 255).astype(np.uint8)
-                # Safety net: a finished frame should never be materially blurrier
-                # than its own develop. If it is (a grade artifact slipped through),
-                # ship the clean develop rather than a blurred edit. We'd rather
-                # deliver an ungraded-but-sharp frame than a smeared one.
+    device = next(model.parameters()).device.type if model else None
+    for stem, p in sorted(dngs.items()):
+        try:
+            dev = develop(p).astype(np.float32)
+            if model:
+                out = np.clip(dev + grade_delta(model, dev.astype(np.uint8), device), 0, 255).astype(np.uint8)
+                # Safety net: never ship a frame materially blurrier than its
+                # develop — fall back to the clean develop if the model regresses.
                 dev_u8 = dev.astype(np.uint8)
-                s_out, s_dev = _sharpness(out), _sharpness(dev_u8)
-                if s_dev > 0 and s_out < 0.6 * s_dev:
-                    print(f"  GUARD {stem}: edit blurrier than develop "
-                          f"({s_out:.0f} < 0.6*{s_dev:.0f}) — shipping develop", flush=True)
+                if _sharpness(dev_u8) > 0 and _sharpness(out) < 0.6 * _sharpness(dev_u8):
+                    print(f"  GUARD {stem}: edit blurrier than develop — shipping develop", flush=True)
                     out = dev_u8
-                outp = os.path.join(a.out_dir, f"{stem}.jpg")
-                cv2.imwrite(outp, out, [cv2.IMWRITE_JPEG_QUALITY, a.quality])
-                copy_exif(p, outp)
-                edited += 1
-                print(f"  edit {stem} ({out.shape[1]}x{out.shape[0]})", flush=True)
-            except Exception as e:
-                print(f"  ERR {stem}: {str(e)[:120]}", flush=True)
+            else:
+                out = gentle_finish(dev.astype(np.uint8))
+            outp = os.path.join(a.out_dir, f"{stem}.jpg")
+            cv2.imwrite(outp, out, [cv2.IMWRITE_JPEG_QUALITY, a.quality])
+            copy_exif(p, outp)
+            edited += 1
+            print(f"  edit {stem} ({out.shape[1]}x{out.shape[0]})", flush=True)
+        except Exception as e:
+            print(f"  ERR {stem}: {str(e)[:120]}", flush=True)
     # pass-through: JPGs with no companion DNG, copied byte-for-byte (no re-encode)
     for stem, p in sorted(jpgs.items()):
         if stem in dngs:
