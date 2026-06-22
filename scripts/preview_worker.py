@@ -22,10 +22,12 @@ Queue (R2 arem-training-data):
 import os, sys, time, json, tempfile
 from pathlib import Path
 import cv2, numpy as np, torch, boto3
+import torch.nn as nn
+import torchvision.models as tvm
 
 BASE = Path(os.environ.get("AREM_WORKER_DIR", str(Path(__file__).resolve().parent.parent)))
 sys.path.insert(0, str(BASE))
-from pipeline.run_pipeline import load_stage2, load_classifier, classify, stage2_infer  # noqa: E402
+from pipeline.run_pipeline import load_stage2, stage2_infer  # noqa: E402
 
 BUCKET = os.environ.get("R2_BUCKET", "arem-training-data")
 P_REQ = "preview-jobs/requests"
@@ -63,10 +65,41 @@ def s3_get(key): return S3.get_object(Bucket=BUCKET, Key=key)["Body"].read()
 def s3_put(key, data, ct): S3.put_object(Bucket=BUCKET, Key=key, Body=data, ContentType=ct)
 def s3_del(key): S3.delete_object(Bucket=BUCKET, Key=key)
 
+# Fast int/ext router (mobilenet_v3_small @384) — distilled from the 12MP teacher.
+# ~7ms vs ~280ms; preview-only (delivery keeps the full-accuracy router). The
+# routing just picks which Stage-2 model renders the preview.
+FAST_ROUTER_KEY = os.environ.get("FAST_ROUTER_R2KEY", "models/preview-router/fast_router_v1.pt")
+_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+def load_fast_router():
+    local = BASE / "checkpoints" / "fast_router_v1.pt"
+    if not (local.is_file() and local.stat().st_size > 0):
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_bytes(s3_get(FAST_ROUTER_KEY))
+    ck = torch.load(str(local), map_location=DEV)
+    m = tvm.mobilenet_v3_small()
+    m.classifier[-1] = nn.Linear(m.classifier[-1].in_features, 2)
+    m.load_state_dict(ck["model_state"])
+    return m.to(DEV).eval(), ck["label_names"]
+
+def _letterbox384(bgr):
+    h, w = bgr.shape[:2]; s = 384 / max(h, w); nw, nh = max(1, round(w * s)), max(1, round(h * s))
+    r = cv2.resize(bgr, (nw, nh)); c = np.zeros((384, 384, 3), np.uint8)
+    t, l = (384 - nh) // 2, (384 - nw) // 2; c[t:t + nh, l:l + nw] = r; return c
+
+def classify_fast(model, labels, bgr):
+    t = torch.from_numpy(_letterbox384(bgr)[:, :, ::-1].copy()).permute(2, 0, 1).float() / 255.0
+    x = ((t - _MEAN) / _STD).unsqueeze(0).to(DEV)
+    with torch.inference_mode():
+        p = torch.softmax(model(x), 1)[0].cpu().numpy()
+    idx = int(p.argmax())
+    return labels[idx] == "interior", labels[idx]
+
 def write_result(rid, payload):
     s3_put(f"{P_RES}/{rid}.done.json", json.dumps(payload).encode(), "application/json")
 
-def process(rid, clf, s2_int, s2_ext):
+def process(rid, router, rlabels, s2_int, s2_ext):
     t0 = time.time()
     # 1) pull the bracket's input frames (in memory — no rclone)
     in_keys = sorted(s3_list(f"{P_INP}/{rid}/"))
@@ -87,11 +120,11 @@ def process(rid, clf, s2_int, s2_ext):
     h, w = base.shape[:2]; lo = max(h, w)
     if lo > PREVIEW_MAX:
         s = PREVIEW_MAX / lo; base = cv2.resize(base, (int(round(w * s)), int(round(h * s))))
-    # 3) route + enhance (GPU step needs file paths → local temp, fast)
+    # 3) route (fast mobilenet on the in-memory image) + enhance
+    is_int, label = classify_fast(router, rlabels, base)
     with tempfile.TemporaryDirectory() as tds:
         td = Path(tds)
         src = td / "src.jpg"; cv2.imwrite(str(src), base, [cv2.IMWRITE_JPEG_QUALITY, 92])
-        is_int, _, label = classify(*clf, str(src), DEV)
         out = td / "out.jpg"
         stage2_infer(s2_int if is_int else s2_ext, src, out, DEV)
         result = out.read_bytes()
@@ -103,10 +136,10 @@ def process(rid, clf, s2_int, s2_ext):
 
 def main():
     log(f"loading models on {DEV} …")
-    clf = load_classifier(BASE / "pipeline" / "classifier_v4.pth", DEV)
+    router, rlabels = load_fast_router()
     s2_int = load_stage2(BASE / "checkpoints" / "may26_interior_w32_b4_4gpu_ep35_inference.pth", DEV)
     s2_ext = load_stage2(BASE / "checkpoints" / "may26_exterior_w32_b4_4gpu_ep29_inference.pth", DEV)
-    log(f"ready (shard {SHARD}/{SHARDS}, boto3 I/O), polling {P_REQ} …")
+    log(f"ready (shard {SHARD}/{SHARDS}, boto3 I/O, fast router), polling {P_REQ} …")
     while True:
         try:
             keys = s3_list(f"{P_REQ}/")
@@ -120,7 +153,7 @@ def main():
         for rj in reqs:
             rid = rj[:-5]
             try:
-                process(rid, clf, s2_int, s2_ext)
+                process(rid, router, rlabels, s2_int, s2_ext)
             except Exception as e:
                 log(f"{rid} ERROR {str(e)[:200]}"); write_result(rid, {"status": "error", "error": str(e)[:200]})
             try:
