@@ -5,86 +5,115 @@ route interior/exterior → Stage-2 NAFNet), and writes the result back. Models
 stay resident so each preview is sub-second of GPU. Reuses the production
 loaders from pipeline.run_pipeline so the look matches the real deliverable.
 
+I/O is in-process **boto3** (persistent, connection-pooled S3 client) — NOT
+rclone. rclone shelled out ~4 processes per request (~0.3-0.5s spawn each) and
+DOMINATED the ~3s/request time; the GPU work at ≤1600px is only ~0.2-0.5s. boto3
+keeps everything in memory → most of that overhead disappears.
+
+Multi-worker: PREVIEW_SHARD / PREVIEW_SHARDS shard the queue by request-id hash
+so N nodes split the load with no coordination and no double-processing.
+
 Queue (R2 arem-training-data):
   preview-jobs/requests/<id>.json   {frames:N, ts}
   preview-jobs/input/<id>/<i>.jpg   the N embedded JPEGs the app sent
   preview-jobs/results/<id>.jpg      enhanced preview
   preview-jobs/results/<id>.done.json {status, resultKey, scene, ms} | {status:error,error}
 """
-import os, sys, time, json, subprocess, tempfile, glob
+import os, sys, time, json, tempfile
 from pathlib import Path
-import cv2, numpy as np, torch
+import cv2, numpy as np, torch, boto3
 
 BASE = Path(os.environ.get("AREM_WORKER_DIR", str(Path(__file__).resolve().parent.parent)))
 sys.path.insert(0, str(BASE))
 from pipeline.run_pipeline import load_stage2, load_classifier, classify, stage2_infer  # noqa: E402
 
-R2 = os.environ.get("RCLONE_R2", "r2")
 BUCKET = os.environ.get("R2_BUCKET", "arem-training-data")
-REQ = f"{R2}:{BUCKET}/preview-jobs/requests"
-INP = f"{R2}:{BUCKET}/preview-jobs/input"
-RES = f"{R2}:{BUCKET}/preview-jobs/results"
+P_REQ = "preview-jobs/requests"
+P_INP = "preview-jobs/input"
+P_RES = "preview-jobs/results"
 PREVIEW_MAX = int(os.environ.get("PREVIEW_MAX_PX", "1600"))
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
-# Multi-worker sharding: run this worker on N nodes, each with a distinct
-# PREVIEW_SHARD in [0, PREVIEW_SHARDS). Each node only claims requests whose id
-# hashes to its shard, so the queue splits evenly with NO coordination and no
-# request is ever processed twice. Throughput scales linearly with node count.
 SHARD = int(os.environ.get("PREVIEW_SHARD", "0"))
 SHARDS = int(os.environ.get("PREVIEW_SHARDS", "1"))
 
+# Persistent S3 (Cloudflare R2) client — reused across every request.
+S3 = boto3.client(
+    "s3",
+    endpoint_url=f"https://{os.environ['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com",
+    aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
+    aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
+    region_name="auto",
+)
+
 def log(m): print(f"[preview] {m}", flush=True)
-def rc(args, timeout=60): return subprocess.run(["rclone"] + args, capture_output=True, text=True, timeout=timeout)
+
+def s3_list(prefix):
+    out, tok = [], None
+    while True:
+        kw = {"Bucket": BUCKET, "Prefix": prefix}
+        if tok:
+            kw["ContinuationToken"] = tok
+        r = S3.list_objects_v2(**kw)
+        out += [o["Key"] for o in r.get("Contents", [])]
+        if not r.get("IsTruncated"):
+            return out
+        tok = r.get("NextContinuationToken")
+
+def s3_get(key): return S3.get_object(Bucket=BUCKET, Key=key)["Body"].read()
+def s3_put(key, data, ct): S3.put_object(Bucket=BUCKET, Key=key, Body=data, ContentType=ct)
+def s3_del(key): S3.delete_object(Bucket=BUCKET, Key=key)
 
 def write_result(rid, payload):
-    p = Path(tempfile.gettempdir()) / f"pvres_{rid}.json"
-    p.write_text(json.dumps(payload))
-    rc(["copyto", str(p), f"{RES}/{rid}.done.json"], timeout=20)
-    try: p.unlink()
-    except OSError: pass
+    s3_put(f"{P_RES}/{rid}.done.json", json.dumps(payload).encode(), "application/json")
 
 def process(rid, clf, s2_int, s2_ext):
     t0 = time.time()
+    # 1) pull the bracket's input frames (in memory — no rclone)
+    in_keys = sorted(s3_list(f"{P_INP}/{rid}/"))
+    imgs = []
+    for k in in_keys:
+        im = cv2.imdecode(np.frombuffer(s3_get(k), np.uint8), cv2.IMREAD_COLOR)
+        if im is not None:
+            imgs.append(im)
+    if not imgs:
+        raise RuntimeError("no decodable input frames")
+    # 2) fuse the bracket (window/exposure recovery) if >1 frame
+    if len(imgs) >= 2:
+        h = min(i.shape[0] for i in imgs); w = min(i.shape[1] for i in imgs)
+        imgs = [cv2.resize(i, (w, h)) for i in imgs]
+        base = np.clip(cv2.createMergeMertens().process(imgs) * 255, 0, 255).astype(np.uint8)
+    else:
+        base = imgs[0]
+    h, w = base.shape[:2]; lo = max(h, w)
+    if lo > PREVIEW_MAX:
+        s = PREVIEW_MAX / lo; base = cv2.resize(base, (int(round(w * s)), int(round(h * s))))
+    # 3) route + enhance (GPU step needs file paths → local temp, fast)
     with tempfile.TemporaryDirectory() as tds:
         td = Path(tds)
-        if rc(["copyto", f"{REQ}/{rid}.json", str(td / "req.json")], timeout=20).returncode != 0:
-            return
-        rc(["copy", f"{INP}/{rid}", str(td)], timeout=120)
-        ins = sorted(glob.glob(str(td / "*.jpg")))
-        if not ins:
-            raise RuntimeError("no input frames")
-        # fuse the bracket (window/exposure recovery) if >1 frame
-        if len(ins) >= 2:
-            imgs = [cv2.imread(p) for p in ins]
-            h = min(i.shape[0] for i in imgs); w = min(i.shape[1] for i in imgs)
-            imgs = [cv2.resize(i, (w, h)) for i in imgs]
-            base = np.clip(cv2.createMergeMertens().process(imgs) * 255, 0, 255).astype(np.uint8)
-        else:
-            base = cv2.imread(ins[0])
-        h, w = base.shape[:2]; lo = max(h, w)
-        if lo > PREVIEW_MAX:
-            s = PREVIEW_MAX / lo; base = cv2.resize(base, (int(round(w * s)), int(round(h * s))))
         src = td / "src.jpg"; cv2.imwrite(str(src), base, [cv2.IMWRITE_JPEG_QUALITY, 92])
-        # route + enhance (the AREM look)
         is_int, _, label = classify(*clf, str(src), DEV)
         out = td / "out.jpg"
         stage2_infer(s2_int if is_int else s2_ext, src, out, DEV)
-        rc(["copyto", str(out), f"{RES}/{rid}.jpg"], timeout=60)
-        dt = int((time.time() - t0) * 1000)
-        write_result(rid, {"status": "done", "resultKey": f"preview-jobs/results/{rid}.jpg", "scene": label, "ms": dt})
-        log(f"{rid} -> done {label} {dt}ms")
+        result = out.read_bytes()
+    # 4) write result + done marker (boto3)
+    s3_put(f"{P_RES}/{rid}.jpg", result, "image/jpeg")
+    dt = int((time.time() - t0) * 1000)
+    write_result(rid, {"status": "done", "resultKey": f"{P_RES}/{rid}.jpg", "scene": label, "ms": dt})
+    log(f"{rid} -> done {label} {dt}ms")
 
 def main():
     log(f"loading models on {DEV} …")
     clf = load_classifier(BASE / "pipeline" / "classifier_v4.pth", DEV)
     s2_int = load_stage2(BASE / "checkpoints" / "may26_interior_w32_b4_4gpu_ep35_inference.pth", DEV)
     s2_ext = load_stage2(BASE / "checkpoints" / "may26_exterior_w32_b4_4gpu_ep29_inference.pth", DEV)
-    log(f"ready (shard {SHARD}/{SHARDS}), polling preview-jobs/requests …")
+    log(f"ready (shard {SHARD}/{SHARDS}, boto3 I/O), polling {P_REQ} …")
     while True:
-        r = rc(["lsf", REQ, "--include", "*.json"], timeout=30)
-        reqs = [x for x in r.stdout.split() if x.endswith(".json")] if r.returncode == 0 else []
+        try:
+            keys = s3_list(f"{P_REQ}/")
+        except Exception as e:
+            log(f"list error {str(e)[:160]}"); time.sleep(1); continue
+        reqs = [k.split("/")[-1] for k in keys if k.endswith(".json")]
         if SHARDS > 1:
-            # Claim only this node's slice of the id-space (hex id → shard).
             reqs = [x for x in reqs if int(x[:8], 16) % SHARDS == SHARD]
         if not reqs:
             time.sleep(0.25); continue
@@ -94,7 +123,10 @@ def main():
                 process(rid, clf, s2_int, s2_ext)
             except Exception as e:
                 log(f"{rid} ERROR {str(e)[:200]}"); write_result(rid, {"status": "error", "error": str(e)[:200]})
-            rc(["deletefile", f"{REQ}/{rj}"], timeout=20)
+            try:
+                s3_del(f"{P_REQ}/{rj}")
+            except Exception as e:
+                log(f"{rid} del error {str(e)[:120]}")
 
 if __name__ == "__main__":
     sys.exit(main())
