@@ -26,6 +26,12 @@ INP = f"{R2}:{BUCKET}/preview-jobs/input"
 RES = f"{R2}:{BUCKET}/preview-jobs/results"
 PREVIEW_MAX = int(os.environ.get("PREVIEW_MAX_PX", "1600"))
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
+# Multi-worker sharding: run this worker on N nodes, each with a distinct
+# PREVIEW_SHARD in [0, PREVIEW_SHARDS). Each node only claims requests whose id
+# hashes to its shard, so the queue splits evenly with NO coordination and no
+# request is ever processed twice. Throughput scales linearly with node count.
+SHARD = int(os.environ.get("PREVIEW_SHARD", "0"))
+SHARDS = int(os.environ.get("PREVIEW_SHARDS", "1"))
 
 def log(m): print(f"[preview] {m}", flush=True)
 def rc(args, timeout=60): return subprocess.run(["rclone"] + args, capture_output=True, text=True, timeout=timeout)
@@ -73,10 +79,13 @@ def main():
     clf = load_classifier(BASE / "pipeline" / "classifier_v4.pth", DEV)
     s2_int = load_stage2(BASE / "checkpoints" / "may26_interior_w32_b4_4gpu_ep35_inference.pth", DEV)
     s2_ext = load_stage2(BASE / "checkpoints" / "may26_exterior_w32_b4_4gpu_ep29_inference.pth", DEV)
-    log("ready, polling preview-jobs/requests …")
+    log(f"ready (shard {SHARD}/{SHARDS}), polling preview-jobs/requests …")
     while True:
         r = rc(["lsf", REQ, "--include", "*.json"], timeout=30)
         reqs = [x for x in r.stdout.split() if x.endswith(".json")] if r.returncode == 0 else []
+        if SHARDS > 1:
+            # Claim only this node's slice of the id-space (hex id → shard).
+            reqs = [x for x in reqs if int(x[:8], 16) % SHARDS == SHARD]
         if not reqs:
             time.sleep(0.25); continue
         for rj in reqs:
